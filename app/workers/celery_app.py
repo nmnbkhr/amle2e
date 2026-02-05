@@ -41,7 +41,7 @@ celery_app.conf.update(
 
     # Worker settings
     worker_prefetch_multiplier=1,  # Disable prefetching for long tasks
-    worker_concurrency=2,  # Max concurrent tasks per worker
+    worker_concurrency=1,  # One pipeline task at a time (GPU memory safety)
 
     # Task routing (disabled for single-worker setup; enable for scaling)
     # task_routes={

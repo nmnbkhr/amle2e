@@ -1,11 +1,10 @@
 """
 Pipeline Registry
 
-Defines available pipelines (legacy root notebooks, e2e core/dashboards/realtime)
+Defines available E2E pipelines (core/dashboards/realtime)
 and provides step resolution, listing, and manifest writing.
 
 Pipeline Variants:
-  legacy-root   — Existing 12-step pipeline (root *.ipynb, 1-12)
   e2e-core      — Core E2E pipeline (01-08 + conditional 00 based on dataset_mode)
   e2e-dashboards — e2e-core + interactive & analytics dashboards (09, 10)
   e2e-realtime  — Real-time notebooks only (11, 12), on-demand
@@ -134,20 +133,20 @@ def get_excluded_notebooks(
 # Explicit step lists (avoids 00 collision from numeric discovery)
 # ---------------------------------------------------------------------------
 
-# E2E core steps (01-08)
+# E2E core steps (01-05) — ML pipeline only
 _E2E_CORE_STEPS = [
     "01_data_loading_and_features.ipynb",
     "02_graph_sage_embeddings.ipynb",
     "03_wgan_gp_anomaly_detector.ipynb",
     "04_scoring_and_visualization.ipynb",
     "05_predict_and_evaluate.ipynb",
+]
+
+# Visualization & dashboard steps (06-10)
+_E2E_DASHBOARD_STEPS = [
     "06_visualize_results.ipynb",
     "07_analytical_dashboard.ipynb",
     "08_pattern_analysis.ipynb",
-]
-
-# Dashboard steps
-_E2E_DASHBOARD_STEPS = [
     "09_interactive_dashboard.ipynb",
     "10_advanced_analytics_dashboard.ipynb",
 ]
@@ -196,35 +195,12 @@ def _register(spec: PipelineSpec) -> PipelineSpec:
     return spec
 
 
-LEGACY_ROOT = _register(PipelineSpec(
-    name="legacy-root",
-    display_name="Legacy Hopsworks Pipeline",
-    description=(
-        "Original 12-step pipeline using Hopsworks feature store, "
-        "node2vec embeddings, and GAN anomaly detection. "
-        "Notebooks 1-12 in the project root."
-    ),
-    notebooks_dir=".",
-    ordered_steps=[],                   # uses numeric discovery (legacy behavior)
-    conditional_00=False,
-    optional_markers=["maggy", "hp"],
-    default_parameters={
-        "sample_size": 20000,
-        "epochs": 5,
-        "threshold": 0.99,
-    },
-    kernel_name="python3",
-    supports_papermill=True,
-    cwd_relative=None,
-    flags={"include_dashboards": False, "include_realtime": False},
-))
-
 E2E_CORE = _register(PipelineSpec(
     name="e2e-core",
     display_name="E2E PyTorch Core",
     description=(
-        "Core pipeline: GraphSAGE embeddings + WGAN-GP anomaly detection. "
-        "Runs 01-08 in e2e/. Prepends 00_map or 00_simulate based on dataset mode."
+        "Core ML pipeline: GraphSAGE embeddings + WGAN-GP anomaly detection. "
+        "Runs 01-05 in e2e/. Prepends 00_map or 00_simulate based on dataset mode."
     ),
     notebooks_dir="e2e",
     ordered_steps=list(_E2E_CORE_STEPS),
@@ -244,8 +220,8 @@ E2E_DASHBOARDS = _register(PipelineSpec(
     name="e2e-dashboards",
     display_name="E2E + Dashboards",
     description=(
-        "Core pipeline (01-08) plus interactive dashboards (09, 10). "
-        "Includes advanced analytics and risk ranking dashboards."
+        "Core pipeline (01-05) plus visualizations & dashboards (06-10). "
+        "Includes graph analysis, pattern analysis, and analytics dashboards."
     ),
     notebooks_dir="e2e",
     ordered_steps=list(_E2E_CORE_STEPS) + list(_E2E_DASHBOARD_STEPS),
@@ -316,8 +292,6 @@ def resolve_steps(
       - dataset_mode "simulate"             → prepend 00_simulate_transactions
       - dataset_mode "demodata"             → no 00 step
 
-    For legacy-root: falls back to numeric discovery.
-
     Returns list of step dicts with keys:
         number, notebook, name, optional, path
     """
@@ -325,10 +299,6 @@ def resolve_steps(
         project_root = get_repo_root()
 
     nb_dir = project_root / spec.notebooks_dir
-
-    # Legacy pipeline: dynamic numeric discovery
-    if not spec.ordered_steps:
-        return _discover_legacy_steps(nb_dir, spec)
 
     # Build ordered step list
     filenames: List[str] = []
@@ -372,48 +342,6 @@ def resolve_steps(
         f"Resolved {len(steps)} steps for '{spec.name}' "
         f"(dataset_mode={dataset_mode})"
     )
-    return steps
-
-
-def _discover_legacy_steps(
-    nb_dir: Path,
-    spec: PipelineSpec,
-) -> List[Dict[str, Any]]:
-    """
-    Numeric discovery for legacy-root pipeline (existing behaviour).
-    Skips 0 and 13.
-    """
-    import re
-
-    pattern = re.compile(r"^(\d+)_(.+)\.ipynb$")
-    skip = {0, 13}
-    steps: List[Dict[str, Any]] = []
-
-    for nb_file in sorted(nb_dir.glob("*.ipynb")):
-        match = pattern.match(nb_file.name)
-        if not match:
-            continue
-        number = int(match.group(1))
-        if number in skip:
-            continue
-
-        name_part = match.group(2)
-        display_name = name_part.replace("_", " ").title()
-        is_optional = any(
-            m in nb_file.name.lower() or m in display_name.lower()
-            for m in spec.optional_markers
-        )
-
-        steps.append({
-            "number": number,
-            "notebook": nb_file.name,
-            "name": display_name,
-            "optional": is_optional,
-            "path": str(nb_file),
-            "role": infer_role(nb_file.name),
-        })
-
-    steps.sort(key=lambda s: s["number"])
     return steps
 
 

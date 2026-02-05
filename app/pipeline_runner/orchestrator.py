@@ -1,8 +1,8 @@
 """
 Pipeline Orchestrator
 
-Executes AML pipeline notebooks sequentially using papermill.
-Supports multiple pipelines (legacy root notebooks, e2e PyTorch pipeline)
+Executes AML E2E pipeline notebooks sequentially.
+Supports multiple e2e pipeline variants (core, dashboards, realtime)
 via the pipeline registry, and multiple dataset profiles via the dataset
 registry.
 
@@ -18,14 +18,13 @@ Features:
 
 import os
 import sys
-import re
 import json
 import shutil
 import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Optional, Dict, Any, List, Tuple
+from typing import Callable, Optional, Dict, Any, Tuple
 from io import StringIO
 
 from ..utils.paths import (
@@ -43,7 +42,7 @@ from .pipeline_registry import (
     resolve_steps,
     write_manifest,
     PipelineSpec,
-    LEGACY_ROOT,
+    E2E_CORE,
 )
 from ..datasets.dataset_registry import (
     get_dataset,
@@ -81,67 +80,6 @@ RUN_PROFILES = {
         "description": "Heavy run - requires 12GB+ VRAM",
     },
 }
-
-
-def discover_notebooks(project_root: Path) -> List[Dict[str, Any]]:
-    """
-    Automatically discover notebooks in the project.
-
-    Prefers numbered notebooks (1_*, 2_*, etc.) in the root directory.
-    Falls back to a configurable list if discovery fails.
-
-    Returns:
-        List of step dictionaries with notebook info
-    """
-    notebooks = []
-
-    # Look for numbered notebooks in root directory
-    pattern = re.compile(r'^(\d+)_(.+)\.ipynb$')
-
-    for nb_file in sorted(project_root.glob("*.ipynb")):
-        match = pattern.match(nb_file.name)
-        if match:
-            number = int(match.group(1))
-            name_part = match.group(2).replace("_", " ").title()
-
-            # Skip notebook 0 (SAML-D mapping) — one-time data prep utility.
-            # Skip notebook 13 (interactive dashboard) — standalone app,
-            # not a pipeline step. It reads from completed run artifacts.
-            if number in (0, 13):
-                continue
-
-            # Determine if step is optional (HP tuning steps)
-            is_optional = "maggy" in nb_file.name.lower() or "hp" in name_part.lower()
-
-            notebooks.append({
-                "number": number,
-                "notebook": nb_file.name,
-                "name": name_part,
-                "optional": is_optional,
-                "path": str(nb_file),
-            })
-
-    if not notebooks:
-        # Fallback to hardcoded list
-        logger.warning("No numbered notebooks found, using default list")
-        notebooks = [
-            {"number": 1, "notebook": "1_create_feature_groups.ipynb", "name": "Create Feature Groups"},
-            {"number": 2, "notebook": "2_prep_training_dataset_for_embeddings.ipynb", "name": "Prepare Training Dataset"},
-            {"number": 3, "notebook": "3_maggy_node_embeddings.ipynb", "name": "Node Embeddings HP Tuning", "optional": True},
-            {"number": 4, "notebook": "4_compute_node_embeddings.ipynb", "name": "Compute Node Embeddings"},
-            {"number": 5, "notebook": "5_predict_and_create_node_embeddings_fg.ipynb", "name": "Create Embeddings Feature Group"},
-            {"number": 6, "notebook": "6_create_anomaly_detection_td.ipynb", "name": "Create Anomaly Detection Dataset"},
-            {"number": 7, "notebook": "7_maggy_adversarial_aml.ipynb", "name": "Autoencoder HP Tuning", "optional": True},
-            {"number": 8, "notebook": "8_train_adversarial_aml.ipynb", "name": "Train Anomaly Detection Model"},
-            {"number": 9, "notebook": "9_aml_model_server.ipynb", "name": "Model Inference Testing"},
-            {"number": 10, "notebook": "10_visualize_results.ipynb", "name": "Visualize Results"},
-            {"number": 11, "notebook": "11_analytical_dashboard.ipynb", "name": "Analytical Dashboard"},
-            {"number": 12, "notebook": "12_aml_pattern_analysis.ipynb", "name": "Pattern Analysis"},
-        ]
-
-    # Sort by number
-    notebooks.sort(key=lambda x: x["number"])
-    return notebooks
 
 
 class NotebookExecutor:
@@ -335,7 +273,7 @@ class PipelineOrchestrator:
         Args:
             run_id: Unique identifier for this run
             params: Optional parameters to customize the run.
-                    Recognised keys include *pipeline_name* (str, default "legacy-root"),
+                    Recognised keys include *pipeline_name* (str, default "e2e-core"),
                     *dataset_mode* (str, default "demodata"), and
                     *sampling_profile* (str, default from dataset spec).
             progress_callback: Callback function(step, name, percent) for progress updates
@@ -351,12 +289,12 @@ class PipelineOrchestrator:
         self._extract_params()
 
         # Resolve pipeline spec from registry
-        pipeline_name = self.params.get("pipeline_name", "legacy-root")
+        pipeline_name = self.params.get("pipeline_name", "e2e-core")
         try:
             self.pipeline_spec: PipelineSpec = get_pipeline(pipeline_name)
         except KeyError:
-            logger.warning(f"Unknown pipeline '{pipeline_name}', falling back to legacy-root")
-            self.pipeline_spec = LEGACY_ROOT
+            logger.warning(f"Unknown pipeline '{pipeline_name}', falling back to e2e-core")
+            self.pipeline_spec = E2E_CORE
 
         # Resolve dataset spec from registry
         try:
@@ -377,6 +315,8 @@ class PipelineOrchestrator:
         self.notebooks_dir = self.artifacts_dir / "notebooks_executed"
         self.metrics_dir = self.artifacts_dir / "metrics"
         self.queues_dir = self.artifacts_dir / "queues"
+        self.cases_dir = self.artifacts_dir / "cases"
+        self.results_dir = self.artifacts_dir / "results"
         self.pipeline_dir = self.artifacts_dir / "pipeline"
 
         # Create artifact directories
@@ -389,9 +329,10 @@ class PipelineOrchestrator:
             project_root=self.project_root,
         )
         if not self.pipeline_steps:
-            # Fallback: legacy discover_notebooks() for backward compat
-            logger.warning("Pipeline registry returned 0 steps; falling back to discover_notebooks()")
-            self.pipeline_steps = discover_notebooks(self.project_root)
+            raise RuntimeError(
+                f"Pipeline '{self.pipeline_spec.name}' resolved 0 steps — "
+                f"check that e2e/ notebooks exist."
+            )
         self.total_steps = len(self.pipeline_steps)
 
         # Resolve working directory for notebook execution
@@ -519,6 +460,8 @@ class PipelineOrchestrator:
             self.notebooks_dir,
             self.metrics_dir,
             self.queues_dir,
+            self.cases_dir,
+            self.results_dir,
             self.pipeline_dir,
         ]
         for dir_path in dirs:
@@ -701,16 +644,15 @@ class PipelineOrchestrator:
         """
         Organize outputs within the artifact directory.
 
-        Notebooks write all outputs (data, PNGs, models) directly to
-        artifacts_dir/data/ and artifacts_dir/models/ via the injected
-        artifacts_dir parameter. This method moves PNGs from data/ to
-        plots/ for the UI. It does NOT copy from local project directories
-        (output/, training_data/, models/) to avoid overwriting run-specific
-        results with stale data from previous runs.
+        Notebooks write outputs to artifacts_dir/{data,models,results,queues,cases}/
+        via AML_RUN_DIR env var. This method:
+        1. Moves PNGs from data/ to plots/
+        2. Moves PNGs from results/ to plots/
+        3. Falls back to sweeping e2e/results/ for any notebooks that wrote locally
         """
         logger.info("Collecting pipeline outputs...")
 
-        collected_files = {"plots": [], "data": [], "models": []}
+        collected_files = {"plots": [], "data": [], "models": [], "results": [], "queues": [], "cases": []}
 
         # Move PNGs from data_dir to plots_dir (notebooks write them to OUTPUT_PATH = data/)
         for img_file in self.data_dir.glob("*.png"):
@@ -723,6 +665,54 @@ class PipelineOrchestrator:
             dest = self.plots_dir / img_file.name
             shutil.move(str(img_file), str(dest))
             collected_files["plots"].append(img_file.name)
+
+        # Move PNGs from results/ to plots/
+        results_dir = self.artifacts_dir / "results"
+        if results_dir.exists():
+            for img_file in results_dir.glob("*.png"):
+                dest = self.plots_dir / img_file.name
+                shutil.move(str(img_file), str(dest))
+                collected_files["plots"].append(img_file.name)
+                logger.debug(f"Moved plot from results/ to plots/: {img_file.name}")
+
+        # Fallback: sweep e2e/results/ for notebooks that wrote locally
+        local_results = self.notebook_cwd / "results"
+        if local_results.exists() and local_results != results_dir:
+            results_dir.mkdir(parents=True, exist_ok=True)
+            cases_dir = self.artifacts_dir / "cases"
+            cases_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy results/ top-level files
+            for f in local_results.iterdir():
+                if f.is_file():
+                    dest = results_dir / f.name if f.suffix != ".png" else self.plots_dir / f.name
+                    if not dest.exists():
+                        shutil.copy2(str(f), str(dest))
+                        cat = "plots" if f.suffix == ".png" else "results"
+                        collected_files[cat].append(f.name)
+                        logger.debug(f"Copied from local results/: {f.name} -> {cat}/")
+
+            # Copy results/queues/ -> queues/
+            local_queues = local_results / "queues"
+            if local_queues.exists():
+                for f in local_queues.iterdir():
+                    if f.is_file():
+                        dest = self.queues_dir / f.name
+                        if not dest.exists():
+                            shutil.copy2(str(f), str(dest))
+                            collected_files["queues"].append(f.name)
+                            logger.debug(f"Copied from local results/queues/: {f.name}")
+
+            # Copy results/cases/ -> cases/
+            local_cases = local_results / "cases"
+            if local_cases.exists():
+                for f in local_cases.iterdir():
+                    if f.is_file():
+                        dest = cases_dir / f.name
+                        if not dest.exists():
+                            shutil.copy2(str(f), str(dest))
+                            collected_files["cases"].append(f.name)
+                            logger.debug(f"Copied from local results/cases/: {f.name}")
 
         # Count data files already in artifacts
         for data_file in self.data_dir.glob("*.parquet"):
@@ -738,7 +728,9 @@ class PipelineOrchestrator:
                 collected_files["models"].append(model_dir.name)
 
         logger.info(f"Output collection complete: {len(collected_files['plots'])} plots, "
-                    f"{len(collected_files['data'])} data files, {len(collected_files['models'])} models")
+                    f"{len(collected_files['data'])} data files, {len(collected_files['models'])} models, "
+                    f"{len(collected_files['results'])} results, "
+                    f"{len(collected_files['queues'])} queue files, {len(collected_files['cases'])} case files")
 
         return collected_files
 
@@ -882,8 +874,8 @@ class PipelineOrchestrator:
                     completed_steps += 1
                     continue
 
-                # Skip visualization steps if not requested
-                if step_num >= 10 and not self.generate_viz:
+                # Skip visualization/dashboard steps (06+) if not requested
+                if step_num >= 6 and not self.generate_viz:
                     logger.info(f"Skipping visualization step {step_num}: {step_name}")
                     self._update_progress(step_num, f"{step_name} (skipped)", (step_num / self.total_steps) * 90)
                     self._update_step_status(step_num, step_name, "skipped")
@@ -960,33 +952,38 @@ class PipelineOrchestrator:
 
             self._update_progress(self.total_steps, "Finalizing: building risk queue", 97)
 
-            # Build risk queue
-            try:
-                from .risk_ranking import build_risk_queue
-                queue_summary = build_risk_queue(self.artifacts_dir)
-                self.results["risk_queue"] = queue_summary
-                logger.info(f"Risk queue built: {queue_summary.get('total_entities', 0)} entities")
-                # Rebuild artifact index so it picks up new queues/ files
+            # Build risk queue (skip if NB10 already produced it)
+            queue_exists = (self.queues_dir / "risk_queue.parquet").exists()
+            if queue_exists:
+                logger.info("Risk queue already exists (from NB10), skipping build_risk_queue()")
+            else:
                 try:
-                    self._build_artifact_index()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(f"Failed to build risk queue: {e}")
+                    from .risk_ranking import build_risk_queue
+                    queue_summary = build_risk_queue(self.artifacts_dir)
+                    self.results["risk_queue"] = queue_summary
+                    logger.info(f"Risk queue built: {queue_summary.get('total_entities', 0)} entities")
+                except Exception as e:
+                    logger.warning(f"Failed to build risk queue: {e}")
 
-            # Build investigation cases (Phase B)
-            try:
-                from .case_builder import build_cases
-                case_summary = build_cases(self.artifacts_dir)
-                self.results["cases"] = case_summary
-                logger.info(f"Cases built: {case_summary.get('total_cases', 0)} cases")
-                # Rebuild artifact index so it picks up cases/ files
+            # Build investigation cases (skip if NB10 already produced them)
+            cases_dir = self.artifacts_dir / "cases"
+            cases_exist = (cases_dir / "case_index.parquet").exists()
+            if cases_exist:
+                logger.info("Cases already exist (from NB10), skipping build_cases()")
+            else:
                 try:
-                    self._build_artifact_index()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(f"Failed to build cases: {e}")
+                    from .case_builder import build_cases
+                    case_summary = build_cases(self.artifacts_dir)
+                    self.results["cases"] = case_summary
+                    logger.info(f"Cases built: {case_summary.get('total_cases', 0)} cases")
+                except Exception as e:
+                    logger.warning(f"Failed to build cases: {e}")
+
+            # Rebuild artifact index to pick up all files (queues/, cases/)
+            try:
+                self._build_artifact_index()
+            except Exception:
+                pass
 
             self._update_progress(self.total_steps, "Finalizing: generating report", 99)
 
@@ -1036,7 +1033,72 @@ class PipelineOrchestrator:
 
     def cleanup(self):
         """
-        Cleanup any temporary resources.
+        Cleanup resources: kill orphan notebook kernels and free GPU memory.
+
+        Called from the Celery task's ``finally`` block so it runs on
+        success, failure, cancellation, and timeout.
         """
-        # Currently no cleanup needed, but this is a hook for future use
-        pass
+        # 1. Kill any notebook kernel subprocesses spawned by this worker
+        self._kill_child_processes()
+
+        # 2. Free GPU memory
+        self._cleanup_gpu()
+
+    # ------------------------------------------------------------------
+    # Internal helpers for cleanup
+    # ------------------------------------------------------------------
+
+    def _kill_child_processes(self):
+        """Kill all child processes of the current worker (orphan kernels)."""
+        import signal
+
+        try:
+            import psutil
+        except ImportError:
+            # psutil not available — fall back to os-level cleanup
+            logger.warning("psutil not installed; skipping child-process cleanup")
+            return
+
+        try:
+            current = psutil.Process()
+            children = current.children(recursive=True)
+            if not children:
+                return
+
+            logger.info(f"Killing {len(children)} orphan child process(es)")
+            for child in children:
+                try:
+                    child.send_signal(signal.SIGTERM)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            # Give them 3 s to exit, then SIGKILL survivors
+            _, alive = psutil.wait_procs(children, timeout=3)
+            for child in alive:
+                try:
+                    child.kill()
+                    logger.info(f"Force-killed child PID {child.pid}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+        except Exception as e:
+            logger.warning(f"Child-process cleanup error: {e}")
+
+    @staticmethod
+    def _cleanup_gpu():
+        """Release GPU memory held by the current process."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("GPU cache cleared (torch.cuda.empty_cache)")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"GPU cleanup error: {e}")
+
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass

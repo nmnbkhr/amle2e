@@ -20,14 +20,33 @@ from ..pipeline_runner.orchestrator import PipelineOrchestrator
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_gpu():
+    """Release GPU memory held by the current worker process."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("GPU cache cleared after task exit")
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"GPU cleanup error: {e}")
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+
 class PipelineTask(Task):
     """
-    Custom Celery task class with error handling and state management.
+    Custom Celery task class with error handling, state management,
+    and GPU resource cleanup on any exit path.
     """
     abstract = True
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
-        """Called when task fails"""
+        """Called when task fails — update DB and free GPU."""
         run_id = args[0] if args else kwargs.get("run_id")
         logger.error(f"Pipeline task {task_id} failed for run {run_id}: {exc}")
 
@@ -44,10 +63,13 @@ class PipelineTask(Task):
             finally:
                 session.close()
 
+        _cleanup_gpu()
+
     def on_success(self, retval, task_id, args, kwargs):
-        """Called when task succeeds"""
+        """Called when task succeeds — free GPU."""
         run_id = args[0] if args else kwargs.get("run_id")
         logger.info(f"Pipeline task {task_id} completed successfully for run {run_id}")
+        _cleanup_gpu()
 
 
 def update_progress(session, run_id: str, step: int, step_name: str, progress_percent: float):
@@ -223,9 +245,16 @@ def run_pipeline_task(self, run_id: str) -> dict:
         raise
 
     finally:
-        session.close()
+        # Always cleanup: kill orphan kernels + free GPU memory
         if orchestrator:
-            orchestrator.cleanup()
+            try:
+                orchestrator.cleanup()
+            except Exception as cleanup_err:
+                logger.warning(f"Orchestrator cleanup error: {cleanup_err}")
+        else:
+            # orchestrator never initialised — still free GPU
+            _cleanup_gpu()
+        session.close()
 
 
 @celery_app.task(bind=True, name="cleanup_old_runs")

@@ -53,21 +53,35 @@ class HealthResponse(BaseModel):
     celery: str
 
 
-# Pipeline step definitions (12 steps from the existing notebooks)
-PIPELINE_STEPS = [
-    {"number": 1, "name": "Create Feature Groups", "notebook": "1_create_feature_groups.ipynb"},
-    {"number": 2, "name": "Prepare Training Dataset", "notebook": "2_prep_training_dataset_for_embeddings.ipynb"},
-    {"number": 3, "name": "Node Embeddings HP Tuning", "notebook": "3_maggy_node_embeddings.ipynb"},
-    {"number": 4, "name": "Compute Node Embeddings", "notebook": "4_compute_node_embeddings.ipynb"},
-    {"number": 5, "name": "Create Embeddings Feature Group", "notebook": "5_predict_and_create_node_embeddings_fg.ipynb"},
-    {"number": 6, "name": "Create Anomaly Detection Dataset", "notebook": "6_create_anomaly_detection_td.ipynb"},
-    {"number": 7, "name": "Autoencoder HP Tuning", "notebook": "7_maggy_adversarial_aml.ipynb"},
-    {"number": 8, "name": "Train Anomaly Detection Model", "notebook": "8_train_adversarial_aml.ipynb"},
-    {"number": 9, "name": "Model Inference Testing", "notebook": "9_aml_model_server.ipynb"},
-    {"number": 10, "name": "Visualize Results", "notebook": "10_visualize_results.ipynb"},
-    {"number": 11, "name": "Analytical Dashboard", "notebook": "11_analytical_dashboard.ipynb"},
-    {"number": 12, "name": "Pattern Analysis", "notebook": "12_aml_pattern_analysis.ipynb"},
+# Default fallback step definitions (only used if no manifest exists)
+DEFAULT_PIPELINE_STEPS = [
+    {"number": 1, "name": "Data Loading And Features", "notebook": "01_data_loading_and_features.ipynb"},
+    {"number": 2, "name": "Graph Sage Embeddings", "notebook": "02_graph_sage_embeddings.ipynb"},
+    {"number": 3, "name": "WGAN GP Anomaly Detector", "notebook": "03_wgan_gp_anomaly_detector.ipynb"},
+    {"number": 4, "name": "Scoring And Visualization", "notebook": "04_scoring_and_visualization.ipynb"},
+    {"number": 5, "name": "Predict And Evaluate", "notebook": "05_predict_and_evaluate.ipynb"},
 ]
+
+
+def _get_pipeline_steps_for_run(run_id: str) -> list:
+    """Get pipeline step definitions for a specific run from its manifest."""
+    from pathlib import Path
+    import json
+    from ...utils.paths import get_run_dir
+
+    manifest_path = get_run_dir(run_id) / "pipeline" / "pipeline_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            steps = manifest.get("steps", [])
+            return [
+                {"number": s["number"], "name": s["name"], "notebook": s["notebook"]}
+                for s in steps
+            ]
+        except Exception as e:
+            logger.warning(f"Failed to read pipeline manifest for {run_id}: {e}")
+
+    return DEFAULT_PIPELINE_STEPS
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -122,9 +136,9 @@ async def get_pipeline_steps():
     """
     Get the list of all pipeline steps.
 
-    Returns the step definitions without run-specific status.
+    Returns the default step definitions without run-specific status.
     """
-    return {"steps": PIPELINE_STEPS, "total_steps": len(PIPELINE_STEPS)}
+    return {"steps": DEFAULT_PIPELINE_STEPS, "total_steps": len(DEFAULT_PIPELINE_STEPS)}
 
 
 @router.get("/{run_id}", response_model=RunStatusDetail)
@@ -147,11 +161,12 @@ async def get_run_status(run_id: str, db: Session = Depends(get_db)):
         .all()
     )
 
-    # Build step status list, merging with step definitions
+    # Build step status list, merging with step definitions from manifest
     steps = []
     logged_steps = {log.step_number: log for log in step_logs}
+    pipeline_steps = _get_pipeline_steps_for_run(run_id)
 
-    for step_def in PIPELINE_STEPS:
+    for step_def in pipeline_steps:
         step_num = step_def["number"]
         if step_num in logged_steps:
             log = logged_steps[step_num]

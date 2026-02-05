@@ -49,8 +49,8 @@ def _resolve_artifact_dir(run: PipelineRun) -> Path:
 class RunParams(BaseModel):
     """Parameters for starting a pipeline run"""
     pipeline_name: str = Field(
-        default="legacy-root",
-        description="Pipeline: legacy-root, e2e-core, e2e-dashboards, e2e-realtime",
+        default="e2e-core",
+        description="Pipeline: e2e-core, e2e-dashboards, e2e-realtime",
     )
     profile: str = Field(default="standard", description="Run profile: quick, standard, heavy")
     dataset_mode: str = Field(
@@ -143,6 +143,35 @@ def get_run_profiles():
             description=config["description"],
         ))
     return {"profiles": profiles}
+
+
+@router.get("/completed-sources")
+def list_completed_source_runs(
+    limit: int = 20,
+    db: Session = Depends(get_db),
+):
+    """List completed runs that have trained models, suitable as source for e2e-realtime."""
+    completed = (
+        db.query(PipelineRun)
+        .filter(PipelineRun.status == RunStatus.COMPLETED)
+        .order_by(PipelineRun.completed_at.desc())
+        .limit(limit)
+        .all()
+    )
+    results = []
+    for run in completed:
+        artifact_dir = _resolve_artifact_dir(run)
+        if (artifact_dir / "models" / "graphsage.pt").exists():
+            run_params = run.params or {}
+            results.append({
+                "id": run.id,
+                "pipeline_name": run_params.get("pipeline_name", "unknown"),
+                "dataset_mode": run_params.get("dataset_mode", "unknown"),
+                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+                "total_nodes": run.total_nodes,
+                "anomalies_detected": run.anomalies_detected,
+            })
+    return {"runs": results}
 
 
 @router.post("/", response_model=CreateRunResponse)
@@ -1043,22 +1072,27 @@ def get_table_page(
 
     artifact_dir = _resolve_artifact_dir(run)
 
-    # Search common subdirectories for the parquet file
-    parquet_path = None
-    for subdir in ["data", "prepared_data", "queues", "cases", ""]:
-        candidate = artifact_dir / subdir / f"{table_name}.parquet" if subdir else artifact_dir / f"{table_name}.parquet"
-        if candidate.exists():
-            parquet_path = candidate
+    # Search common subdirectories for parquet or CSV files
+    data_path = None
+    search_dirs = ["data", "prepared_data", "queues", "cases", ""]
+    for subdir in search_dirs:
+        base = artifact_dir / subdir if subdir else artifact_dir
+        for ext in (".parquet", ".csv"):
+            candidate = base / f"{table_name}{ext}"
+            if candidate.exists():
+                data_path = candidate
+                break
+        if data_path:
             break
 
-    if not parquet_path:
+    if not data_path:
         raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found in run artifacts")
 
     try:
         from ...datasets.saml_d_ingest import query_large_table
 
         order = f"{sort_by} {'ASC' if sort_order == 'asc' else 'DESC'}" if sort_by else None
-        return query_large_table(parquet_path, offset=offset, limit=limit, order_by=order)
+        return query_large_table(data_path, offset=offset, limit=limit, order_by=order)
     except Exception as e:
         logger.error(f"DuckDB query failed for {table_name}: {e}")
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")

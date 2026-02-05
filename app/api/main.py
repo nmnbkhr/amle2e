@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..db import init_db
-from .routes import runs_router, status_router, artifacts_router, pipelines_router
+from .routes import runs_router, status_router, artifacts_router, pipelines_router, simulation_router
 
 # Configure logging
 logging.basicConfig(
@@ -36,13 +36,19 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     logger.info("Shutting down AML Pipeline Runner API...")
+    try:
+        from ..simulation.engine import simulation_manager
+        simulation_manager.reset()
+        logger.info("Simulation manager cleaned up")
+    except Exception as e:
+        logger.warning(f"Simulation cleanup error: {e}")
 
 
 # Create FastAPI application
 app = FastAPI(
     title="AML Pipeline Runner",
     description="API for running and monitoring the AML end-to-end detection pipeline",
-    version="1.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -60,6 +66,7 @@ app.include_router(runs_router)
 app.include_router(status_router)
 app.include_router(artifacts_router)
 app.include_router(pipelines_router)
+app.include_router(simulation_router)
 
 
 @app.get("/")
@@ -67,7 +74,7 @@ async def root():
     """Root endpoint - API information"""
     return {
         "name": "AML Pipeline Runner API",
-        "version": "1.0.0",
+        "version": "2.1.0",
         "docs": "/docs",
         "health": "/status/health",
         "endpoints": {
@@ -76,6 +83,7 @@ async def root():
             "datasets": "/datasets",
             "status": "/status",
             "artifacts": "/artifacts",
+            "simulation": "/simulation",
         },
     }
 

@@ -279,24 +279,34 @@ def list_tables(run_id: str, db: Session = Depends(get_db)):
     """
     List all data table files for a run.
 
-    Returns CSV and Parquet files from the data directory.
+    Returns CSV and Parquet files from data, prepared_data, queues, cases dirs.
     """
     run = db.query(PipelineRun).filter(PipelineRun.id == run_id).first()
     if not run:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
-    artifact_dir = _resolve_artifact_dir(run) / "data"
+    artifact_dir = _resolve_artifact_dir(run)
     tables = []
+    seen = set()
 
-    if artifact_dir.exists():
+    for subdir in ["data", "prepared_data", "queues", "cases", ""]:
+        scan_dir = artifact_dir / subdir if subdir else artifact_dir
+        if not scan_dir.exists():
+            continue
         for ext in ["*.csv", "*.parquet"]:
-            for filepath in artifact_dir.glob(ext):
+            for filepath in scan_dir.glob(ext):
+                if filepath.name in seen:
+                    continue
+                seen.add(filepath.name)
+                rel = filepath.relative_to(artifact_dir)
+                stem = filepath.stem
                 tables.append({
                     "name": filepath.name,
-                    "path": f"data/{filepath.name}",
-                    "url": f"/artifacts/{run_id}/file/data/{filepath.name}",
+                    "stem": stem,
+                    "path": str(rel),
+                    "url": f"/artifacts/{run_id}/file/{rel}",
                     "size_bytes": filepath.stat().st_size,
-                    "format": filepath.suffix[1:],  # Remove the dot
+                    "format": filepath.suffix[1:],
                 })
 
     return {"run_id": run_id, "tables": tables, "total_count": len(tables)}
@@ -306,72 +316,53 @@ def list_tables(run_id: str, db: Session = Depends(get_db)):
 def get_table_data(
     run_id: str,
     table_name: str,
-    limit: int = Query(default=100, le=1000),
+    limit: int = Query(default=100, le=2000),
     offset: int = Query(default=0, ge=0),
     sort_by: Optional[str] = None,
     sort_desc: bool = False,
     db: Session = Depends(get_db),
 ):
     """
-    Get paginated data from a table file.
+    DuckDB-based paginated access to any CSV/Parquet table in a run's artifacts.
 
-    Supports CSV and Parquet files. Returns JSON data with pagination info.
-    Uses safe_join_run to prevent path traversal.
+    Safe for 9.5M-row files — never loads full table into memory.
+    Table names are sanitised to prevent path traversal.
     """
+    import re as _re
+
     run = db.query(PipelineRun).filter(PipelineRun.id == run_id).first()
     if not run:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
-    data_dir = _resolve_artifact_dir(run) / "data"
+    # Sanitise table_name (alphanumeric + underscore only)
+    if not _re.match(r'^[a-zA-Z0-9_]+$', table_name):
+        raise HTTPException(status_code=400, detail="Invalid table name")
 
-    # Find the table file
+    artifact_dir = _resolve_artifact_dir(run)
+
+    # Search common subdirectories for parquet or CSV files
     table_path = None
-    for ext in [".csv", ".parquet"]:
-        candidate = data_dir / f"{table_name}{ext}"
-        if candidate.exists():
-            table_path = candidate
+    for subdir in ["data", "prepared_data", "queues", "cases", ""]:
+        base = artifact_dir / subdir if subdir else artifact_dir
+        for ext in [".parquet", ".csv"]:
+            candidate = base / f"{table_name}{ext}"
+            if candidate.exists():
+                table_path = candidate
+                break
+        if table_path:
             break
 
-        # Also try with the extension already in the name
-        candidate = data_dir / table_name
-        if candidate.exists():
-            table_path = candidate
-            break
-
-    if not table_path or not table_path.exists():
+    if not table_path:
         raise HTTPException(status_code=404, detail=f"Table not found: {table_name}")
 
     try:
-        import pandas as pd
+        from ...datasets.saml_d_ingest import query_large_table
 
-        # Read the file
-        if str(table_path).endswith(".parquet"):
-            df = pd.read_parquet(table_path)
-        else:
-            df = pd.read_csv(table_path)
-
-        total_rows = len(df)
-        columns = list(df.columns)
-
-        # Apply sorting
-        if sort_by and sort_by in df.columns:
-            df = df.sort_values(by=sort_by, ascending=not sort_desc)
-
-        # Apply pagination
-        df_page = df.iloc[offset:offset + limit]
-
-        # Convert to records (handle NaN values)
-        records = df_page.fillna("").to_dict(orient="records")
-
-        return {
-            "run_id": run_id,
-            "table_name": table_name,
-            "columns": columns,
-            "total_rows": total_rows,
-            "offset": offset,
-            "limit": limit,
-            "data": records,
-        }
+        order = f"{sort_by} {'ASC' if not sort_desc else 'DESC'}" if sort_by else None
+        result = query_large_table(table_path, offset=offset, limit=limit, order_by=order)
+        result["run_id"] = run_id
+        result["table_name"] = table_name
+        return result
 
     except Exception as e:
         logger.error(f"Failed to read table {table_name}: {e}")

@@ -5,11 +5,13 @@ A single-page application with tabs for:
 - Run: Start new pipeline runs with profile selection
 - Status: Monitor running/completed jobs with auto-refresh
 - Dashboard: View visualizations, metrics, and anomaly data
-- Analytics: Interactive Plotly charts from run data
+- Graph & Scoring: Pre-computed graph analysis, financial metrics, and pattern rules (NB06-08)
 - Report: Access and download generated reports
-- Interactive: Full interactive dashboard with 5 analysis sub-tabs
+- Tables: DuckDB-paginated data table explorer (safe for 9.5M-row files)
 - Tier Queue: Risk-ranked entity queue with filtering and export
 - Cases: Investigation-ready AML cases with typology detection and network graphs
+- AML Scores: 5-signal composite scoring with risk bands
+- Simulation: Real-time simulation results from NB11 (latency, alerts, scores)
 
 Run with: streamlit run app/ui/streamlit_app.py
 """
@@ -836,37 +838,53 @@ def render_run_tab():
     pipeline_options = {}
     if pipelines_data:
         for p in pipelines_data.get("pipelines", []):
-            pipeline_options[p["name"]] = p
+            if p["name"] != "e2e-realtime":  # Simulation now runs from its own tab
+                pipeline_options[p["name"]] = p
     else:
         # Fallback if API not yet updated
         pipeline_options = {
-            "legacy-root": {"name": "legacy-root", "display_name": "Legacy Hopsworks Pipeline",
-                            "description": "Original 12-step pipeline in project root"},
             "e2e-core": {"name": "e2e-core", "display_name": "E2E PyTorch Core",
-                         "description": "GraphSAGE + WGAN-GP core (01-08)"},
+                         "description": "GraphSAGE + WGAN-GP ML pipeline (01-05)"},
             "e2e-dashboards": {"name": "e2e-dashboards", "display_name": "E2E + Dashboards",
-                               "description": "Core + interactive & analytics dashboards (09, 10)"},
-            "e2e-realtime": {"name": "e2e-realtime", "display_name": "E2E Real-Time Only",
-                             "description": "Real-time simulation (11, 12) — requires prior core run"},
+                               "description": "Core + visualizations & dashboards (06-10)"},
         }
 
+    # Notebook range labels for each pipeline
+    _NB_RANGES = {
+        "e2e-core": "01-05",
+        "e2e-dashboards": "01-10",
+        "e2e-realtime": "11-12",
+    }
+
     pip_cols = st.columns(len(pipeline_options))
-    selected_pipeline = st.session_state.get("selected_pipeline", "legacy-root")
+    selected_pipeline = st.session_state.get("selected_pipeline", "e2e-core")
 
     for idx, (pname, pinfo) in enumerate(pipeline_options.items()):
         with pip_cols[idx]:
             is_sel = pname == selected_pipeline
-            border = "var(--cyan, #22D3EE)" if is_sel else "var(--border, #243042)"
+            border = "#22D3EE" if is_sel else "#243042"
+            bg = "rgba(34,211,238,0.06)" if is_sel else "transparent"
+            nb_range = _NB_RANGES.get(pname, "")
+            steps_list = pinfo.get("ordered_steps", [])
+            step_count = len(steps_list) if steps_list else ""
+            badge = f"<span style='background:#22D3EE;color:#000;padding:2px 8px;border-radius:4px;font-size:0.75em;font-weight:600;'>{nb_range}</span>" if nb_range else ""
+            count_label = f"<span style='color:#9CA3AF;font-size:0.75em;'>{step_count} notebooks</span>" if step_count else ""
+
             st.markdown(f"""
-            <div style="border: 2px solid {border}; padding: 12px; border-radius: 8px; min-height: 110px;">
-                <h4 style="margin:0; font-size:0.95em;">{pinfo.get('display_name', pname)}</h4>
-                <p style="color: var(--muted, #9CA3AF); font-size: 0.8em; margin: 4px 0 0 0;">
+            <div style="border: 2px solid {border}; background: {bg}; padding: 14px; border-radius: 8px; min-height: 130px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                    <h4 style="margin:0; font-size:0.95em;">{pinfo.get('display_name', pname)}</h4>
+                    {badge}
+                </div>
+                <p style="color: #9CA3AF; font-size: 0.8em; margin: 4px 0 8px 0;">
                     {pinfo.get('description', '')}
                 </p>
+                {count_label}
             </div>
             """, unsafe_allow_html=True)
             if st.button(f"Select", key=f"sel_pipe_{pname}",
-                        type="primary" if is_sel else "secondary"):
+                        type="primary" if is_sel else "secondary",
+                        use_container_width=True):
                 st.session_state["selected_pipeline"] = pname
                 st.rerun()
 
@@ -1052,7 +1070,10 @@ def render_run_tab():
                 st.error("Failed to start pipeline. Check if the API and Celery worker are running.")
 
     if start_disabled:
-        st.caption("Enable the confirmation checkbox above to start with Full sampling.")
+        if selected_pipeline == "e2e-realtime" and not source_run_id:
+            st.caption("Select a completed source run above to start the simulation pipeline.")
+        else:
+            st.caption("Enable the confirmation checkbox above to start with Full sampling.")
 
     # ── Pipeline Map with Role Categories ─────────────────────────────
     with st.expander("Pipeline Map"):
@@ -1092,7 +1113,7 @@ def render_run_tab():
             status = run["status"]
             emoji = get_status_emoji(status)
             run_params = run.get("params", {})
-            run_pipeline = run_params.get("pipeline_name", "legacy-root")
+            run_pipeline = run_params.get("pipeline_name", "e2e-core")
             run_ds = run_params.get("dataset_mode", run_params.get("data_source", "demodata"))
 
             col1, col2, col3, col4, col5, col6 = st.columns([3, 1.2, 1, 1.5, 1.5, 1])
@@ -1128,13 +1149,17 @@ def render_status_tab():
 
     run_options = {f"{r['id'][:8]}... ({r['status']}) - {format_datetime(r['created_at'])}": r["id"] for r in runs}
 
-    # Use active run if set
+    # Use active run if set — clear stale IDs that no longer exist
     default_idx = 0
+    valid_ids = set(run_options.values())
     if "active_run_id" in st.session_state:
-        for idx, (label, rid) in enumerate(run_options.items()):
-            if rid == st.session_state["active_run_id"]:
-                default_idx = idx
-                break
+        if st.session_state["active_run_id"] not in valid_ids:
+            del st.session_state["active_run_id"]
+        else:
+            for idx, (label, rid) in enumerate(run_options.items()):
+                if rid == st.session_state["active_run_id"]:
+                    default_idx = idx
+                    break
 
     selected_label = st.selectbox("Select Run", options=list(run_options.keys()), index=default_idx)
     selected_run_id = run_options[selected_label]
@@ -1737,13 +1762,109 @@ def render_report_tab():
         """)
 
 
-# --- Analytics (Interactive) Tab ---
+# --- Tables (DuckDB Paginated Explorer) Tab ---
 
-def render_analytics_tab():
-    """Render the Analytics (Interactive) tab with Plotly charts."""
-    st.header("Analytics (Interactive)")
+def render_tables_tab():
+    """Render the Tables explorer tab with server-side DuckDB pagination."""
+    st.header("Data Tables")
 
-    # Run selector
+    runs = api_request("GET", "/runs/?limit=20")
+    if not runs:
+        st.info("No pipeline runs found. Start a run to explore data tables.")
+        return
+
+    completed_runs = [r for r in runs if r["status"] == "completed"]
+    if not completed_runs:
+        st.info("No completed runs. Tables are available after a run completes.")
+        return
+
+    run_options = {
+        f"{r['id'][:8]}... - {format_datetime(r.get('completed_at', r.get('created_at', '')))}": r["id"]
+        for r in completed_runs
+    }
+    selected_label = st.selectbox("Select Run", options=list(run_options.keys()), key="tables_run_select")
+    selected_run_id = run_options[selected_label]
+
+    # Fetch available tables
+    tables_resp = api_request("GET", f"/artifacts/{selected_run_id}/tables")
+    if not tables_resp or not tables_resp.get("tables"):
+        st.info("No data tables found for this run.")
+        return
+
+    tables_list = tables_resp["tables"]
+    table_options = {
+        f"{t['name']}  ({t['format']}, {t['size_bytes'] / 1024:.0f} KB)": t["stem"]
+        for t in tables_list
+    }
+
+    selected_table_label = st.selectbox("Select Table", options=list(table_options.keys()), key="tables_table_select")
+    table_stem = table_options[selected_table_label]
+
+    # Pagination controls
+    st.divider()
+    ctrl_cols = st.columns([1, 1, 2])
+    with ctrl_cols[0]:
+        page_size = st.selectbox("Rows per page", [50, 100, 200, 500, 1000], index=1, key="tables_page_size")
+    with ctrl_cols[1]:
+        page_num = st.number_input("Page", min_value=1, value=1, step=1, key="tables_page_num")
+
+    offset = (page_num - 1) * page_size
+
+    # Fetch paginated data via DuckDB endpoint
+    data = api_request(
+        "GET",
+        f"/runs/{selected_run_id}/table/{table_stem}?limit={page_size}&offset={offset}",
+    )
+
+    if not data:
+        st.error(f"Could not load table '{table_stem}'. The API may be unreachable.")
+        return
+
+    total = data.get("total", 0)
+    columns = data.get("columns", [])
+    rows = data.get("rows", [])
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    # Summary bar
+    with ctrl_cols[2]:
+        st.markdown(f"**{total:,}** rows total &middot; page {page_num} / {total_pages}")
+
+    if not rows:
+        st.info("No data rows returned.")
+        return
+
+    df = pd.DataFrame(rows, columns=columns if columns else None)
+
+    # Column info
+    with st.expander("Column Info", expanded=False):
+        col_info = pd.DataFrame({
+            "Column": df.columns,
+            "Type": [str(df[c].dtype) for c in df.columns],
+            "Non-Null": [df[c].notna().sum() for c in df.columns],
+            "Sample": [str(df[c].iloc[0])[:60] if len(df) > 0 else "" for c in df.columns],
+        })
+        st.dataframe(col_info, use_container_width=True, hide_index=True)
+
+    # Main data table
+    st.dataframe(df, use_container_width=True, hide_index=True, height=500)
+
+    # Download current page as CSV
+    csv_data = df.to_csv(index=False)
+    st.download_button(
+        label=f"Download page {page_num} as CSV",
+        data=csv_data,
+        file_name=f"{table_stem}_page{page_num}.csv",
+        mime="text/csv",
+    )
+
+
+# --- Graph & Scoring Tab ---
+
+def render_graph_scoring_tab():
+    """Render the Graph & Scoring tab with pre-computed NB06-08 outputs."""
+    st.header("Graph & Scoring")
+
+    # Run selector (same pattern as other tabs)
     runs = api_request("GET", "/runs/?limit=15")
     if not runs:
         st.info("No pipeline runs found.")
@@ -1751,7 +1872,7 @@ def render_analytics_tab():
 
     completed_runs = [r for r in runs if r["status"] == "completed"]
     if not completed_runs:
-        st.info("No completed runs found. Complete a pipeline run to view analytics.")
+        st.info("No completed runs found. Complete a pipeline run to view graph & scoring data.")
         return
 
     run_options = {
@@ -1759,7 +1880,9 @@ def render_analytics_tab():
         for r in completed_runs
     }
 
-    selected_label = st.selectbox("Select Run", options=list(run_options.keys()), key="analytics_run_select")
+    selected_label = st.selectbox(
+        "Select Run", options=list(run_options.keys()), key="graph_scoring_run_select"
+    )
     selected_run_id = run_options[selected_label]
 
     # Resolve artifact path from the run record (handles SAML-D custom paths)
@@ -1771,908 +1894,373 @@ def render_analytics_tab():
         run_dir = artifact_path
     else:
         run_dir = get_run_dir(selected_run_id)
-    data_dir = run_dir / "data"
-
-    # Load data files
-    alert_nodes_path = data_dir / "alert_nodes_td.csv"
-    node_td_path = data_dir / "node_td.csv"
-    edges_td_path = data_dir / "edges_td.csv"
-    embeddings_path = data_dir / "node_embeddings_fg.parquet"
-    rules_path = data_dir / "aml_rules.json"
-
-    # Load alert_nodes_td.csv (required)
-    if not alert_nodes_path.exists():
-        st.warning(f"alert_nodes_td.csv not found at: `data/alert_nodes_td.csv`")
-        return
-
-    try:
-        alert_df = pd.read_csv(alert_nodes_path)
-    except Exception as e:
-        st.error(f"Failed to load alert_nodes_td.csv: {e}")
-        return
-
-    # Load optional files
-    node_df = None
-    edges_df = None
-    embeddings_df = None
-    rules_data = None
-
-    if node_td_path.exists():
-        try:
-            node_df = pd.read_csv(node_td_path)
-        except Exception as e:
-            st.warning(f"Could not load node_td.csv: {e}")
-
-    if edges_td_path.exists():
-        try:
-            edges_df = pd.read_csv(edges_td_path)
-        except Exception as e:
-            st.warning(f"Could not load edges_td.csv: {e}")
-
-    if embeddings_path.exists():
-        try:
-            embeddings_df = pd.read_parquet(embeddings_path)
-        except Exception as e:
-            st.warning(f"Could not load node_embeddings_fg.parquet: {e}")
-
-    if rules_path.exists():
-        try:
-            with open(rules_path) as f:
-                rules_data = json.load(f)
-        except Exception as e:
-            st.warning(f"Could not load aml_rules.json: {e}")
-
-    # --- Sidebar Filters ---
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Analytics Filters")
-
-    # SAR filter
-    sar_filter = st.sidebar.radio(
-        "SAR Status",
-        options=["All", "SAR Only", "Non-SAR Only"],
-        key="analytics_sar_filter"
-    )
-
-    # Type multiselect (if type column exists)
-    type_col = None
-    for col in ["type", "node_type", "account_type", "party_type"]:
-        if col in alert_df.columns:
-            type_col = col
-            break
-
-    selected_types = None
-    if type_col:
-        unique_types = alert_df[type_col].dropna().unique().tolist()
-        selected_types = st.sidebar.multiselect(
-            "Filter by Type",
-            options=unique_types,
-            default=unique_types,
-            key="analytics_type_filter"
-        )
-
-    # ID search substring
-    id_search = st.sidebar.text_input("Search ID (substring)", key="analytics_id_search")
-
-    # Deduplicate toggle
-    deduplicate = st.sidebar.checkbox("Deduplicate IDs", value=False, key="analytics_deduplicate")
-
-    # --- Apply Filters ---
-    filtered_df = alert_df.copy()
-
-    # SAR filter
-    if "is_sar" in filtered_df.columns:
-        if sar_filter == "SAR Only":
-            filtered_df = filtered_df[filtered_df["is_sar"] == 1]
-        elif sar_filter == "Non-SAR Only":
-            filtered_df = filtered_df[filtered_df["is_sar"] == 0]
-
-    # Type filter
-    if type_col and selected_types is not None:
-        filtered_df = filtered_df[filtered_df[type_col].isin(selected_types)]
-
-    # ID search
-    if id_search and "id" in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df["id"].astype(str).str.contains(id_search, case=False, na=False)]
-
-    # Deduplicate
-    if deduplicate and "id" in filtered_df.columns:
-        filtered_df = filtered_df.drop_duplicates(subset=["id"], keep="first")
-
-    # Show filter stats
-    st.info(f"Showing {len(filtered_df):,} of {len(alert_df):,} records after filtering")
-
-    # --- Charts ---
-    chart_tabs = st.tabs(["SAR Overview", "Type Analysis", "Degree Analysis", "Embeddings PCA"])
-
-    # --- Tab 1: SAR Overview ---
-    with chart_tabs[0]:
-        st.subheader("SAR vs Non-SAR Distribution")
-
-        if "is_sar" in filtered_df.columns:
-            sar_counts = filtered_df["is_sar"].value_counts().reset_index()
-            sar_counts.columns = ["is_sar", "count"]
-            sar_counts["label"] = sar_counts["is_sar"].map({1: "SAR", 0: "Non-SAR"})
-
-            fig_donut = px.pie(
-                sar_counts,
-                values="count",
-                names="label",
-                title="SAR vs Non-SAR Distribution",
-                hole=0.4,
-                color="label",
-                color_discrete_map={"SAR": "#d62728", "Non-SAR": "#2ca02c"},
-            )
-            fig_donut.update_traces(
-                textposition="inside",
-                textinfo="percent+label",
-                hovertemplate="<b>%{label}</b><br>Count: %{value:,}<br>Percent: %{percent}<extra></extra>"
-            )
-            st.plotly_chart(fig_donut, width="stretch")
-        else:
-            st.warning("is_sar column not found in data")
-
-    # --- Tab 2: Type Analysis ---
-    with chart_tabs[1]:
-        st.subheader("Type Distribution Analysis")
-
-        if type_col and "is_sar" in filtered_df.columns:
-            # Top 30 types by count, split by is_sar
-            type_sar_counts = filtered_df.groupby([type_col, "is_sar"]).size().reset_index(name="count")
-            type_totals = type_sar_counts.groupby(type_col)["count"].sum().sort_values(ascending=False)
-            top_30_types = type_totals.head(30).index.tolist()
-            type_sar_filtered = type_sar_counts[type_sar_counts[type_col].isin(top_30_types)]
-            type_sar_filtered["sar_label"] = type_sar_filtered["is_sar"].map({1: "SAR", 0: "Non-SAR"})
-
-            # Stacked bar chart
-            fig_bar = px.bar(
-                type_sar_filtered,
-                x=type_col,
-                y="count",
-                color="sar_label",
-                title=f"Top 30 Types by Count (Split by SAR Status)",
-                barmode="stack",
-                color_discrete_map={"SAR": "#d62728", "Non-SAR": "#2ca02c"},
-                labels={type_col: "Type", "count": "Count", "sar_label": "Status"},
-            )
-            fig_bar.update_traces(
-                hovertemplate="<b>Type:</b> %{x}<br><b>Count:</b> %{y:,}<extra></extra>"
-            )
-            fig_bar.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_bar, width="stretch")
-
-            # Heatmap: type x SAR counts
-            st.subheader("Type x SAR Heatmap")
-            pivot_df = type_sar_filtered.pivot(index=type_col, columns="sar_label", values="count").fillna(0)
-
-            fig_heatmap = px.imshow(
-                pivot_df.values,
-                x=pivot_df.columns.tolist(),
-                y=pivot_df.index.tolist(),
-                color_continuous_scale="Reds",
-                title="Heatmap: Type x SAR Status",
-                labels={"x": "SAR Status", "y": "Type", "color": "Count"},
-                aspect="auto",
-            )
-            fig_heatmap.update_traces(
-                hovertemplate="<b>Type:</b> %{y}<br><b>Status:</b> %{x}<br><b>Count:</b> %{z:,}<extra></extra>"
-            )
-            st.plotly_chart(fig_heatmap, width="stretch")
-        elif type_col:
-            st.warning("is_sar column not found for type analysis")
-        else:
-            st.warning("No type column found in data")
-
-    # --- Tab 3: Degree Analysis ---
-    with chart_tabs[2]:
-        st.subheader("Node Degree Analysis")
-
-        if edges_df is not None:
-            # Compute degree from edges
-            src_col = None
-            dst_col = None
-            for col in ["source", "src", "from", "sender"]:
-                if col in edges_df.columns:
-                    src_col = col
-                    break
-            for col in ["target", "dst", "to", "receiver"]:
-                if col in edges_df.columns:
-                    dst_col = col
-                    break
-
-            if src_col and dst_col:
-                # Count degree (in + out)
-                src_counts = edges_df[src_col].value_counts()
-                dst_counts = edges_df[dst_col].value_counts()
-                degree_df = pd.DataFrame({
-                    "id": list(set(src_counts.index) | set(dst_counts.index))
-                })
-                degree_df["out_degree"] = degree_df["id"].map(src_counts).fillna(0).astype(int)
-                degree_df["in_degree"] = degree_df["id"].map(dst_counts).fillna(0).astype(int)
-                degree_df["degree"] = degree_df["out_degree"] + degree_df["in_degree"]
-
-                # Merge with alert_df for type/is_sar info
-                if "id" in filtered_df.columns:
-                    degree_df = degree_df.merge(
-                        filtered_df[["id"] + ([type_col] if type_col else []) + (["is_sar"] if "is_sar" in filtered_df.columns else [])].drop_duplicates(),
-                        on="id",
-                        how="left"
-                    )
-
-                # Histogram of degree
-                fig_hist = px.histogram(
-                    degree_df,
-                    x="degree",
-                    nbins=50,
-                    title="Node Degree Distribution",
-                    labels={"degree": "Degree", "count": "Count"},
-                )
-                fig_hist.update_traces(
-                    hovertemplate="<b>Degree:</b> %{x}<br><b>Count:</b> %{y:,}<extra></extra>"
-                )
-                st.plotly_chart(fig_hist, width="stretch")
-
-                # Top 20 nodes by degree
-                st.subheader("Top 20 Nodes by Degree")
-                top_20 = degree_df.nlargest(20, "degree")
-
-                hover_cols = ["id", "degree"]
-                if type_col and type_col in top_20.columns:
-                    hover_cols.append(type_col)
-                if "is_sar" in top_20.columns:
-                    hover_cols.append("is_sar")
-
-                custom_data = [top_20[col] for col in hover_cols[1:]]  # exclude id which is x
-
-                fig_top_degree = px.bar(
-                    top_20,
-                    x="id",
-                    y="degree",
-                    title="Top 20 Nodes by Degree",
-                    labels={"id": "Node ID", "degree": "Degree"},
-                    color="degree",
-                    color_continuous_scale="Blues",
-                )
-
-                # Build hover template
-                hover_parts = ["<b>ID:</b> %{x}"]
-                for i, col in enumerate(hover_cols[1:]):
-                    hover_parts.append(f"<b>{col}:</b> %{{customdata[{i}]}}")
-                hover_template = "<br>".join(hover_parts) + "<extra></extra>"
-
-                fig_top_degree.update_traces(
-                    customdata=np.stack(custom_data, axis=-1) if custom_data else None,
-                    hovertemplate=hover_template
-                )
-                fig_top_degree.update_layout(xaxis_tickangle=-45)
-                st.plotly_chart(fig_top_degree, width="stretch")
-            else:
-                st.warning(f"Could not identify source/target columns in edges_td.csv. Found: {edges_df.columns.tolist()}")
-        else:
-            st.warning("edges_td.csv not found - cannot compute node degrees")
-
-    # --- Tab 4: Embeddings PCA ---
-    with chart_tabs[3]:
-        st.subheader("Embeddings PCA Visualization")
-
-        if embeddings_df is not None:
-            try:
-                from sklearn.decomposition import PCA
-
-                # Find embedding columns (emb_0, emb_1, ... or similar)
-                emb_cols = [c for c in embeddings_df.columns if c.startswith("emb_")]
-                if not emb_cols:
-                    emb_cols = [c for c in embeddings_df.columns if c.startswith("embedding_")]
-                if not emb_cols:
-                    # Try numeric columns excluding known non-embedding ones
-                    exclude = {"id", "is_sar", "type", "score", "amount", "degree"}
-                    emb_cols = [c for c in embeddings_df.select_dtypes(include=[np.number]).columns if c not in exclude]
-
-                if len(emb_cols) >= 2:
-                    # Sample up to 5000 for performance
-                    sample_size = min(5000, len(embeddings_df))
-                    sample_df = embeddings_df.sample(n=sample_size, random_state=42) if len(embeddings_df) > sample_size else embeddings_df.copy()
-
-                    # Apply filters from sidebar
-                    if "is_sar" in sample_df.columns:
-                        if sar_filter == "SAR Only":
-                            sample_df = sample_df[sample_df["is_sar"] == 1]
-                        elif sar_filter == "Non-SAR Only":
-                            sample_df = sample_df[sample_df["is_sar"] == 0]
-
-                    if type_col and type_col in sample_df.columns and selected_types:
-                        sample_df = sample_df[sample_df[type_col].isin(selected_types)]
-
-                    if id_search and "id" in sample_df.columns:
-                        sample_df = sample_df[sample_df["id"].astype(str).str.contains(id_search, case=False, na=False)]
-
-                    if len(sample_df) < 10:
-                        st.warning("Not enough data points after filtering for PCA visualization")
-                    else:
-                        # PCA
-                        X = sample_df[emb_cols].values
-                        pca = PCA(n_components=2)
-                        pca_result = pca.fit_transform(X)
-
-                        sample_df = sample_df.copy()
-                        sample_df["PCA1"] = pca_result[:, 0]
-                        sample_df["PCA2"] = pca_result[:, 1]
-
-                        # Prepare hover data
-                        hover_data = {}
-                        if "id" in sample_df.columns:
-                            hover_data["id"] = True
-                        if type_col and type_col in sample_df.columns:
-                            hover_data[type_col] = True
-                        if "is_sar" in sample_df.columns:
-                            hover_data["is_sar"] = True
-
-                        # Color by is_sar if available
-                        color_col = None
-                        color_map = None
-                        if "is_sar" in sample_df.columns:
-                            sample_df["sar_label"] = sample_df["is_sar"].map({1: "SAR", 0: "Non-SAR", None: "Unknown"})
-                            color_col = "sar_label"
-                            color_map = {"SAR": "#d62728", "Non-SAR": "#2ca02c", "Unknown": "#7f7f7f"}
-
-                        fig_pca = px.scatter(
-                            sample_df,
-                            x="PCA1",
-                            y="PCA2",
-                            color=color_col,
-                            color_discrete_map=color_map,
-                            title=f"PCA Visualization of Embeddings (n={len(sample_df):,})",
-                            hover_data=hover_data,
-                            labels={"PCA1": f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)",
-                                   "PCA2": f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)"},
-                        )
-                        fig_pca.update_traces(marker=dict(size=5, opacity=0.7))
-                        fig_pca.update_layout(legend_title_text="SAR Status")
-                        st.plotly_chart(fig_pca, width="stretch")
-
-                        st.caption(f"Explained variance: PC1={pca.explained_variance_ratio_[0]*100:.1f}%, PC2={pca.explained_variance_ratio_[1]*100:.1f}%")
-                else:
-                    st.warning(f"Not enough embedding columns found. Found: {len(emb_cols)} columns")
-            except ImportError:
-                st.error("scikit-learn is required for PCA. Install with: pip install scikit-learn")
-            except Exception as e:
-                st.error(f"Error during PCA: {e}")
-        else:
-            st.warning("node_embeddings_fg.parquet not found - cannot visualize embeddings")
-
-    # --- Debug: Resolved Paths ---
-    with st.expander("Debug: Resolved Paths", expanded=False):
-        # Get debug paths info
-        try:
-            paths_info = debug_paths(selected_run_id)
-
-            st.markdown("**System Paths:**")
-            st.code(f"repo_root: {paths_info['repo_root']}")
-            st.code(f"artifacts_root: {paths_info['artifacts_root']}")
-            st.code(f"run_dir: {paths_info['run_dir']} {'(exists)' if paths_info['run_dir_exists'] else '(NOT FOUND)'}")
-            st.code(f"data_dir: {paths_info['data_dir']} {'(exists)' if paths_info['data_dir_exists'] else '(NOT FOUND)'}")
-
-            st.markdown("**Data Files:**")
-            for fname, info in paths_info.get("files", {}).items():
-                status = "✅" if info.get("exists") else "❌"
-                st.text(f"  {status} {fname}")
-                if not info.get("exists"):
-                    st.caption(f"      Expected: {info.get('path')}")
-
-        except Exception as e:
-            st.error(f"Failed to get debug paths: {e}")
-
-        st.divider()
-        st.markdown("**File Status (from local check):**")
-        files_status = {
-            "alert_nodes_td.csv": alert_nodes_path.exists(),
-            "node_td.csv": node_td_path.exists(),
-            "edges_td.csv": edges_td_path.exists(),
-            "node_embeddings_fg.parquet": embeddings_path.exists(),
-            "aml_rules.json": rules_path.exists(),
-        }
-        for fname, exists in files_status.items():
-            status = "✅" if exists else "❌"
-            st.text(f"  {status} {fname}")
-
-
-# --- Interactive Dashboard Tab ---
-
-def render_interactive_dashboard_tab():
-    """Render the Interactive Dashboard tab — Plotly charts from completed run artifacts."""
-    st.header("Interactive Dashboard")
-
-    # ── Run selector (same pattern as analytics tab) ──
-    runs = api_request("GET", "/runs/?limit=15")
-    if not runs:
-        st.info("No pipeline runs found. Start a new run from the Run tab.")
-        return
-
-    completed_runs = [r for r in runs if r["status"] == "completed"]
-    if not completed_runs:
-        st.info("No completed runs found. Complete a pipeline run first.")
-        return
-
-    run_options = {
-        f"{r['id'][:8]}... - {r.get('params', {}).get('data_source', 'demo-data')} - {format_datetime(r.get('completed_at') or r['created_at'])}": r["id"]
-        for r in completed_runs
-    }
-
-    selected_label = st.selectbox("Select Run", options=list(run_options.keys()), key="idash_run_select")
-    selected_run_id = run_options[selected_label]
-
-    # ── Resolve artifact paths ──
-    run_info = api_request("GET", f"/runs/{selected_run_id}")
-    if run_info and run_info.get("artifact_path"):
-        artifact_path = Path(run_info["artifact_path"])
-        if not artifact_path.is_absolute():
-            artifact_path = (get_repo_root() / artifact_path).resolve()
-        run_dir = artifact_path
-    else:
-        run_dir = get_run_dir(selected_run_id)
-    data_dir = run_dir / "data"
-    models_dir = run_dir / "models"
-
-    data_source = run_info.get("params", {}).get("data_source", "demo-data") if run_info else "demo-data"
-
-    # ── Validate required files ──
-    edges_path = data_dir / "edges_td.csv"
-    nodes_path = data_dir / "node_td.csv"
-    embeddings_path = data_dir / "node_embeddings_fg.parquet"
-
-    missing = []
-    if not edges_path.exists():
-        missing.append("edges_td.csv")
-    if not embeddings_path.exists():
-        missing.append("node_embeddings_fg.parquet")
-    if missing:
-        st.warning(f"Missing required files in `{data_dir}`: {', '.join(missing)}")
-        return
-
-    model_dirs = sorted([d for d in models_dir.iterdir() if d.is_dir() and d.name.startswith("gan_anomaly_")]) if models_dir.exists() else []
-    if not model_dirs:
-        st.warning(f"No trained model found in `{models_dir}`")
-        return
-
-    # ── Load data ──
-    with st.spinner("Loading run data..."):
-        edges_df = pd.read_csv(edges_path)
-        nodes_df = pd.read_csv(nodes_path) if nodes_path.exists() else None
-        node_embeddings = pd.read_parquet(embeddings_path)
-
-        latest_model_dir = model_dirs[-1]
-        threshold_val = float(np.load(latest_model_dir / "threshold.npy"))
-
-        # Compute anomaly scores
-        emb_cols = [c for c in node_embeddings.columns if c.startswith("emb_")]
-        from tensorflow import keras
-        model = keras.models.load_model(str(latest_model_dir / "anomaly_detector.keras"))
-        all_embeddings = node_embeddings[emb_cols].values
-        reconstructed = model.predict(all_embeddings, verbose=0)
-        anomaly_scores = np.mean(np.square(all_embeddings - reconstructed), axis=1)
-
-        node_embeddings["anomaly_score"] = anomaly_scores
-        node_embeddings["is_anomaly"] = anomaly_scores > threshold_val
-        score_min, score_max = anomaly_scores.min(), anomaly_scores.max()
-        node_embeddings["risk_score"] = (anomaly_scores - score_min) / (score_max - score_min) if score_max > score_min else 0.0
-
-        # Map risk onto edges
-        node_risk_dict = node_embeddings.set_index("id")["risk_score"].to_dict()
-        node_anomaly_dict = node_embeddings.set_index("id")["is_anomaly"].to_dict()
-
-        edges_df["source_risk"] = edges_df["source"].map(node_risk_dict).fillna(0)
-        edges_df["target_risk"] = edges_df["target"].map(node_risk_dict).fillna(0)
-        edges_df["edge_risk"] = edges_df[["source_risk", "target_risk"]].max(axis=1)
-        edges_df["source_anomaly"] = edges_df["source"].map(node_anomaly_dict).fillna(False)
-        edges_df["target_anomaly"] = edges_df["target"].map(node_anomaly_dict).fillna(False)
-        edges_df["is_suspicious"] = edges_df["source_anomaly"] | edges_df["target_anomaly"]
-
-        # Money flow per node
-        outgoing = edges_df.groupby("source").agg({"base_amt": "sum", "tran_id": "count"}).rename(
-            columns={"base_amt": "outgoing_amt", "tran_id": "outgoing_count"})
-        incoming = edges_df.groupby("target").agg({"base_amt": "sum", "tran_id": "count"}).rename(
-            columns={"base_amt": "incoming_amt", "tran_id": "incoming_count"})
-
-        node_money = node_embeddings[["id", "anomaly_score", "is_anomaly", "risk_score"]].copy()
-        if "is_sar" in node_embeddings.columns:
-            node_money["is_sar"] = node_embeddings["is_sar"]
-        node_money = node_money.merge(outgoing, left_on="id", right_index=True, how="left")
-        node_money = node_money.merge(incoming, left_on="id", right_index=True, how="left")
-        node_money = node_money.fillna(0)
-        node_money["total_volume"] = node_money["outgoing_amt"] + node_money["incoming_amt"]
-        node_money["total_transactions"] = node_money["outgoing_count"] + node_money["incoming_count"]
-        node_money["net_flow"] = node_money["incoming_amt"] - node_money["outgoing_amt"]
-
-        if nodes_df is not None:
-            node_type_dict = nodes_df.set_index("id")["type"].to_dict()
-            node_money = node_money.merge(nodes_df[["id", "type"]], on="id", how="left")
-            edges_df["source_type"] = edges_df["source"].map(node_type_dict).fillna(-1).astype(int)
-            edges_df["target_type"] = edges_df["target"].map(node_type_dict).fillna(-1).astype(int)
-
-        # Loss/savings
-        n_anomalies = int(node_embeddings["is_anomaly"].sum())
-        n_normal = len(node_embeddings) - n_anomalies
-        suspicious_txn_value = float(edges_df[edges_df["is_suspicious"]]["base_amt"].sum())
-
-        DEMO_CONFIG = {
-            "avg_loss_per_undetected_aml": 0.15,
-            "investigation_cost_per_alert": 500,
-            "false_positive_cost": 200,
-            "regulatory_fine_multiplier": 3.0,
-            "recovery_rate_detected": 0.70,
-        }
-
-        if "is_sar" in node_embeddings.columns:
-            tp = int(((node_embeddings["is_sar"] == 1) & (node_embeddings["is_anomaly"])).sum())
-            fp = int(((node_embeddings["is_sar"] == 0) & (node_embeddings["is_anomaly"])).sum())
-            fn = int(((node_embeddings["is_sar"] == 1) & (~node_embeddings["is_anomaly"])).sum())
-            tn = int(((node_embeddings["is_sar"] == 0) & (~node_embeddings["is_anomaly"])).sum())
-        else:
-            tp = int(n_anomalies * 0.10)
-            fp = n_anomalies - tp
-            fn = int(n_normal * 0.01)
-            tn = n_normal - fn
-
-        cfg = DEMO_CONFIG
-        avg_suspicious_txn = suspicious_txn_value / max(n_anomalies, 1)
-        potential_loss_detected = tp * avg_suspicious_txn * cfg["avg_loss_per_undetected_aml"]
-        recovered_amount = potential_loss_detected * cfg["recovery_rate_detected"]
-        normal_txn_value = float(edges_df[~edges_df["is_suspicious"]]["base_amt"].sum())
-        avg_normal_txn = normal_txn_value / max(n_normal, 1)
-        potential_loss_undetected = fn * avg_normal_txn * cfg["avg_loss_per_undetected_aml"]
-        regulatory_fine_risk = potential_loss_undetected * cfg["regulatory_fine_multiplier"]
-        investigation_cost = n_anomalies * cfg["investigation_cost_per_alert"]
-        false_positive_cost = fp * cfg["false_positive_cost"]
-        total_operational_cost = investigation_cost + false_positive_cost
-        net_savings = recovered_amount - total_operational_cost
-
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * (precision * recall) / max(precision + recall, 1e-9)
-
-    # ── Header badges ──
-    src_color = "red" if data_source == "saml-d" else "blue"
-    st.markdown(
-        f"**`{data_source.upper()}`** &nbsp; Run `{selected_run_id[:8]}…` &nbsp; | &nbsp; "
-        f"**{len(node_embeddings):,}** nodes &nbsp; **{len(edges_df):,}** txns &nbsp; **{n_anomalies:,}** anomalies &nbsp; "
-        f"Threshold: `{threshold_val:.6f}`"
-    )
-    st.divider()
-
-    # ── Colour constants ──
-    CLR = dict(blue="#3498db", green="#2ecc71", red="#e74c3c", purple="#9b59b6",
-               orange="#e67e22", yellow="#f1c40f")
-    RISK_COLORS = [CLR["green"], CLR["yellow"], CLR["orange"], CLR["red"]]
-    RISK_LABELS = ["Low", "Medium", "High", "Critical"]
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  Sub-tabs
-    # ══════════════════════════════════════════════════════════════════════
-    stab1, stab2, stab3, stab4, stab5 = st.tabs([
-        "Executive Summary", "Financial Impact", "Network Graph",
-        "Transaction Deep Dive", "Node Risk Profiles",
+    results_dir = run_dir / "results"
+
+    # Sub-tabs
+    tab_graph, tab_financial, tab_patterns = st.tabs([
+        "Graph Analysis", "Financial Analysis", "Pattern Analysis",
     ])
 
-    # ── TAB 1: Executive Summary ──
-    with stab1:
-        # KPI row
-        kc1, kc2, kc3, kc4 = st.columns(4)
-        kc1.metric("Total Transactions", f"{len(edges_df):,}")
-        kc2.metric("Total Volume", f"${edges_df['base_amt'].sum():,.0f}")
-        kc3.metric("Anomalies Detected", f"{n_anomalies:,}")
-        kc4.metric("Detection Rate", f"{100 * node_embeddings['is_anomaly'].mean():.1f}%")
-
-        col1, col2 = st.columns(2)
-
-        # Risk distribution bar
-        risk_cat = pd.cut(node_embeddings["risk_score"], bins=[0, 0.25, 0.5, 0.75, 1.0],
-                          labels=RISK_LABELS, include_lowest=True)
-        risk_counts = risk_cat.value_counts().reindex(RISK_LABELS).fillna(0)
-        fig_risk_bar = go.Figure(go.Bar(
-            x=RISK_LABELS, y=risk_counts.values, marker_color=RISK_COLORS,
-            text=[f"{int(v):,}" for v in risk_counts.values], textposition="outside"))
-        fig_risk_bar.update_layout(title="Risk Distribution", yaxis_title="Nodes", margin=dict(t=40, b=30))
-        col1.plotly_chart(fig_risk_bar, width="stretch")
-
-        # Suspicious vs normal pie
-        susp_vol = float(edges_df[edges_df["is_suspicious"]]["base_amt"].sum())
-        norm_vol = float(edges_df[~edges_df["is_suspicious"]]["base_amt"].sum())
-        fig_pie = go.Figure(go.Pie(
-            labels=["Normal", "Suspicious"], values=[norm_vol, susp_vol],
-            marker_colors=[CLR["blue"], CLR["red"]], hole=0.45, textinfo="label+percent",
-            hovertemplate="%{label}<br>$%{value:,.0f}<extra></extra>"))
-        fig_pie.update_layout(title="Volume: Normal vs Suspicious", margin=dict(t=40, b=10))
-        col2.plotly_chart(fig_pie, width="stretch")
-
-        col3, col4 = st.columns(2)
-
-        # Top 10 risk nodes
-        top10 = node_money.nlargest(10, "risk_score")
-        fig_top10 = go.Figure(go.Bar(
-            y=[f"{r['id'][:10]}… ({r['risk_score']:.2f})" for _, r in top10.iterrows()],
-            x=top10["total_volume"], orientation="h",
-            marker_color=px.colors.sample_colorscale("Reds", top10["risk_score"].values),
-            hovertemplate="Node: %{y}<br>Volume: $%{x:,.0f}<extra></extra>"))
-        fig_top10.update_layout(title="Top 10 Risk Nodes by Volume", xaxis_title="Volume ($)",
-                                yaxis=dict(autorange="reversed"), margin=dict(t=40, b=30, l=160))
-        col3.plotly_chart(fig_top10, width="stretch")
-
-        # Anomaly score curve
-        sorted_scores = np.sort(anomaly_scores)
-        fig_curve = go.Figure()
-        fig_curve.add_trace(go.Scatter(
-            x=list(range(len(sorted_scores))), y=sorted_scores,
-            fill="tozeroy", fillcolor="rgba(52,152,219,0.2)",
-            line=dict(color=CLR["blue"], width=2),
-            hovertemplate="Node %{x}<br>Score: %{y:.6f}<extra></extra>"))
-        fig_curve.add_hline(y=threshold_val, line_dash="dash", line_color="red",
-                            annotation_text=f"Threshold {threshold_val:.6f}")
-        fig_curve.update_layout(title="Anomaly Score Curve", xaxis_title="Nodes (sorted)",
-                                yaxis_title="Score", margin=dict(t=40, b=30))
-        col4.plotly_chart(fig_curve, width="stretch")
-
-    # ── TAB 2: Financial Impact ──
-    with stab2:
-        kc1, kc2, kc3, kc4 = st.columns(4)
-        kc1.metric("Recovered", f"${recovered_amount:,.0f}")
-        kc2.metric("Operational Cost", f"${total_operational_cost:,.0f}")
-        kc3.metric("Net Savings", f"${net_savings:,.0f}")
-        kc4.metric("Regulatory Risk", f"${regulatory_fine_risk:,.0f}")
-
-        col1, col2 = st.columns([5, 7])
-
-        # Confusion matrix
-        cm = np.array([[tn, fp], [fn, tp]])
-        fig_cm = px.imshow(cm, text_auto=True,
-                           x=["Predicted Normal", "Predicted Anomaly"],
-                           y=["Actual Normal", "Actual AML"],
-                           color_continuous_scale="RdYlGn_r", labels=dict(color="Count"))
-        fig_cm.update_layout(title="Detection Matrix", margin=dict(t=40, b=30))
-        col1.plotly_chart(fig_cm, width="stretch")
-
-        # Waterfall
-        fig_wf = go.Figure(go.Waterfall(
-            x=["Suspicious<br>Value", "Loss<br>Avoided", "Recovered",
-               "Investigation<br>Cost", "FP Cost", "Net Savings"],
-            y=[suspicious_txn_value, -potential_loss_detected, recovered_amount,
-               -investigation_cost, -false_positive_cost, net_savings],
-            measure=["absolute", "relative", "relative", "relative", "relative", "total"],
-            connector_line_color="rgba(200,200,200,0.3)",
-            increasing_marker_color=CLR["green"], decreasing_marker_color=CLR["red"],
-            totals_marker_color=CLR["purple"],
-            texttemplate="$%{y:,.0f}", textposition="outside"))
-        fig_wf.update_layout(title="Loss vs Savings Waterfall", yaxis_title="Amount ($)",
-                             margin=dict(t=40, b=30))
-        col2.plotly_chart(fig_wf, width="stretch")
-
-        # Gauges
-        fig_gauges = make_subplots(rows=1, cols=3, specs=[[{"type": "indicator"}] * 3],
-                                   subplot_titles=["Precision", "Recall", "F1 Score"])
-        for i, (name, val, color) in enumerate([
-            ("Precision", precision, CLR["blue"]),
-            ("Recall", recall, CLR["green"]),
-            ("F1", f1, CLR["purple"])
-        ], 1):
-            fig_gauges.add_trace(go.Indicator(
-                mode="gauge+number", value=val * 100, number_suffix="%",
-                gauge=dict(axis=dict(range=[0, 100]), bar_color=color,
-                           steps=[dict(range=[0, 50], color="rgba(255,0,0,0.15)"),
-                                  dict(range=[50, 80], color="rgba(255,255,0,0.10)"),
-                                  dict(range=[80, 100], color="rgba(0,255,0,0.10)")])), row=1, col=i)
-        fig_gauges.update_layout(height=280, margin=dict(t=40, b=10))
-        st.plotly_chart(fig_gauges, width="stretch")
-
-    # ── TAB 3: Network Graph ──
-    with stab3:
-        import networkx as nx
-
-        filter_mode = st.selectbox("Filter", ["All Nodes", "Suspicious Only", "High-Risk Neighborhood"],
-                                   key="idash_net_filter")
-        filter_map = {"All Nodes": "all", "Suspicious Only": "suspicious",
-                      "High-Risk Neighborhood": "high_risk"}
-        fmode = filter_map[filter_mode]
-        max_nodes = 300
-
-        edges_sorted = edges_df.sort_values(["edge_risk", "base_amt"], ascending=[False, False])
-        if fmode == "suspicious":
-            edges_subset = edges_sorted[edges_sorted["is_suspicious"]].head(max_nodes * 3)
-        elif fmode == "high_risk":
-            hr_nodes = set(node_embeddings[node_embeddings["risk_score"] > 0.75]["id"])
-            edges_subset = edges_sorted[
-                edges_sorted["source"].isin(hr_nodes) | edges_sorted["target"].isin(hr_nodes)
-            ].head(max_nodes * 3)
+    # ══════════════════════════════════════════════════════════════════════
+    #  Tab 1: Graph Analysis (NB06 output)
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_graph:
+        scored_path = results_dir / "node_embeddings_scored.parquet"
+        if not scored_path.exists():
+            st.warning(
+                "node_embeddings_scored.parquet not found in `results/`. "
+                "Run notebook 06 (visualize_results) to generate this file."
+            )
         else:
-            edges_subset = edges_sorted.head(max_nodes * 3)
+            try:
+                scored_df = pd.read_parquet(scored_path)
+            except Exception as e:
+                st.error(f"Failed to load node_embeddings_scored.parquet: {e}")
+                return
 
-        sel_nodes = set(edges_subset["source"].tolist() + edges_subset["target"].tolist())
-        if len(sel_nodes) > max_nodes:
-            top_n = node_embeddings[node_embeddings["id"].isin(sel_nodes)].nlargest(max_nodes, "risk_score")["id"]
-            sel_nodes = set(top_n)
-            edges_subset = edges_subset[
-                edges_subset["source"].isin(sel_nodes) & edges_subset["target"].isin(sel_nodes)]
+            total_nodes = len(scored_df)
+            anomaly_count = int(scored_df["is_anomaly"].sum())
+            detection_rate = 100 * anomaly_count / max(total_nodes, 1)
 
-        G = nx.DiGraph()
-        for _, r in edges_subset.iterrows():
-            G.add_edge(r["source"], r["target"], amount=r["base_amt"], risk=r["edge_risk"])
+            # Determine threshold from the data (min anomaly_score among anomalies)
+            anomaly_scores = scored_df[scored_df["is_anomaly"] == True]["anomaly_score"]
+            threshold_val = float(anomaly_scores.min()) if len(anomaly_scores) > 0 else 0.0
 
-        if G.number_of_nodes() == 0:
-            st.info("No nodes match the selected filter.")
+            # KPI row
+            kc1, kc2, kc3, kc4 = st.columns(4)
+            kc1.metric("Total Nodes", f"{total_nodes:,}")
+            kc2.metric("Anomalies Detected", f"{anomaly_count:,}")
+            kc3.metric("Threshold", f"{threshold_val:.6f}")
+            kc4.metric("Detection Rate", f"{detection_rate:.1f}%")
+
+            st.markdown("---")
+
+            # Anomaly score distribution histogram (SAR vs non-SAR)
+            st.subheader("Anomaly Score Distribution")
+            if "is_sar" in scored_df.columns:
+                scored_df["sar_label"] = scored_df["is_sar"].map({1: "SAR", 0: "Non-SAR"})
+                fig_hist = px.histogram(
+                    scored_df,
+                    x="anomaly_score",
+                    color="sar_label",
+                    nbins=80,
+                    color_discrete_map={
+                        "SAR": MODERN_TERMINAL_COLORS["red"],
+                        "Non-SAR": MODERN_TERMINAL_COLORS["green"],
+                    },
+                    labels={"anomaly_score": "Anomaly Score", "sar_label": "SAR Status"},
+                    barmode="overlay",
+                )
+                fig_hist.update_traces(opacity=0.7)
+            else:
+                fig_hist = px.histogram(
+                    scored_df,
+                    x="anomaly_score",
+                    nbins=80,
+                    color_discrete_sequence=[MODERN_TERMINAL_COLORS["cyan"]],
+                    labels={"anomaly_score": "Anomaly Score"},
+                )
+
+            fig_hist.add_vline(
+                x=threshold_val, line_dash="dash",
+                line_color=MODERN_TERMINAL_COLORS["red"],
+                annotation_text=f"Threshold {threshold_val:.4f}",
+            )
+            fig_hist.update_layout(
+                yaxis_type="log",
+                yaxis_title="Count (log)",
+                height=400,
+                margin=dict(t=40, b=40),
+                legend=dict(orientation="h", y=1.08),
+            )
+            apply_modern_terminal_plotly()
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            # Top 20 anomalous nodes table
+            st.subheader("Top 20 Anomalous Nodes")
+            display_cols = ["id", "anomaly_score", "is_anomaly"]
+            if "is_sar" in scored_df.columns:
+                display_cols.append("is_sar")
+            if "risk_score" in scored_df.columns:
+                display_cols.append("risk_score")
+
+            top20 = scored_df.nlargest(20, "anomaly_score")[display_cols].copy()
+            top20["anomaly_score"] = top20["anomaly_score"].round(4)
+            if "risk_score" in top20.columns:
+                top20["risk_score"] = top20["risk_score"].round(4)
+            st.dataframe(top20, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Tab 2: Financial Analysis (NB07 output)
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_financial:
+        metrics_path = results_dir / "financial_metrics.json"
+        money_flow_path = results_dir / "node_money_flow.parquet"
+
+        if not metrics_path.exists():
+            st.warning(
+                "financial_metrics.json not found in `results/`. "
+                "Run notebook 07 (analytical_dashboard) to generate this file."
+            )
         else:
-            pos = nx.spring_layout(G, k=3 / np.sqrt(G.number_of_nodes()), iterations=50, seed=42)
-            edge_x, edge_y = [], []
-            for u, v in G.edges():
-                x0, y0 = pos[u]; x1, y1 = pos[v]
-                edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
+            try:
+                with open(metrics_path) as f:
+                    fin_metrics = json.load(f)
+            except Exception as e:
+                st.error(f"Failed to load financial_metrics.json: {e}")
+                return
 
-            vol_dict = node_money.set_index("id")["total_volume"].to_dict()
-            txn_dict = node_money.set_index("id")["total_transactions"].to_dict()
-            node_x = [pos[n][0] for n in G.nodes()]
-            node_y = [pos[n][1] for n in G.nodes()]
-            n_risk = [node_risk_dict.get(n, 0) for n in G.nodes()]
-            n_vol = [vol_dict.get(n, 0) for n in G.nodes()]
-            vol_mx = max(n_vol) if n_vol else 1
-            n_sizes = [6 + 20 * (v / vol_mx) for v in n_vol]
-            hover = [
-                f"ID: {n[:16]}<br>Risk: {node_risk_dict.get(n,0):.4f}<br>"
-                f"Volume: ${vol_dict.get(n,0):,.0f}<br>Txns: {int(txn_dict.get(n,0)):,}"
-                for n in G.nodes()]
+            # Financial KPIs
+            recovered = float(fin_metrics.get("recovered_amount", 0))
+            op_cost = float(fin_metrics.get("total_operational_cost", 0))
+            net_savings = float(fin_metrics.get("net_savings", 0))
+            tp = int(fin_metrics.get("true_positives", 0))
+            fp = int(fin_metrics.get("false_positives", 0))
+            fn = int(fin_metrics.get("false_negatives", 0))
+            tn = int(fin_metrics.get("true_negatives", 0))
 
-            fig_net = go.Figure(data=[
-                go.Scatter(x=edge_x, y=edge_y, mode="lines",
-                           line=dict(width=0.5, color="rgba(150,150,150,0.3)"), hoverinfo="none"),
-                go.Scatter(x=node_x, y=node_y, mode="markers",
-                           marker=dict(size=n_sizes, color=n_risk, colorscale="RdYlGn_r",
-                                       cmin=0, cmax=1, colorbar=dict(title="Risk"),
-                                       line=dict(width=0.5, color="white")),
-                           text=hover, hoverinfo="text"),
-            ])
-            fig_net.update_layout(
-                title=f"Transaction Network ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)",
-                showlegend=False, hovermode="closest", height=650,
-                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                margin=dict(t=40, b=10, l=10, r=10))
-            st.plotly_chart(fig_net, width="stretch")
+            kc1, kc2, kc3, kc4 = st.columns(4)
+            kc1.metric("Recovered Amount", f"${recovered:,.0f}")
+            kc2.metric("Operational Cost", f"${op_cost:,.0f}")
+            kc3.metric("Net Savings", f"${net_savings:,.0f}")
+            kc4.metric("TP / FP / FN / TN", f"{tp} / {fp} / {fn} / {tn}")
 
-    # ── TAB 4: Transaction Deep Dive ──
-    with stab4:
-        amt_range = st.slider("Amount Range ($)", min_value=0.0,
-                              max_value=float(edges_df["base_amt"].quantile(0.99)),
-                              value=(0.0, float(edges_df["base_amt"].quantile(0.99))),
-                              step=100.0, key="idash_amt_slider")
-        filtered = edges_df[(edges_df["base_amt"] >= amt_range[0]) & (edges_df["base_amt"] <= amt_range[1])]
+            st.markdown("---")
 
-        col1, col2 = st.columns(2)
+            # Confusion matrix
+            col_cm, col_wf = st.columns(2)
 
-        # Amount histogram
-        fig_hist = px.histogram(filtered, x="base_amt", nbins=80,
-                                color_discrete_sequence=[CLR["blue"]],
-                                labels={"base_amt": "Amount ($)"})
-        fig_hist.update_layout(title=f"Amount Distribution ({len(filtered):,} txns)",
-                               yaxis_type="log", yaxis_title="Count (log)", margin=dict(t=40, b=30))
-        col1.plotly_chart(fig_hist, width="stretch")
+            with col_cm:
+                st.subheader("Detection Matrix")
+                cm = np.array([[tn, fp], [fn, tp]])
+                fig_cm = px.imshow(
+                    cm, text_auto=True,
+                    x=["Predicted Normal", "Predicted Anomaly"],
+                    y=["Actual Normal", "Actual AML"],
+                    color_continuous_scale="RdYlGn_r",
+                    labels=dict(color="Count"),
+                )
+                fig_cm.update_layout(height=350, margin=dict(t=40, b=30))
+                apply_modern_terminal_plotly()
+                st.plotly_chart(fig_cm, use_container_width=True)
 
-        # Amount vs risk scatter
-        samp = filtered.sample(min(5000, len(filtered)), random_state=42) if len(filtered) > 0 else filtered
-        fig_scatter = px.scatter(samp, x="base_amt", y="edge_risk",
-                                 color="edge_risk", color_continuous_scale="RdYlGn_r",
-                                 hover_data=["source", "target", "base_amt", "edge_risk"],
-                                 labels={"base_amt": "Amount ($)", "edge_risk": "Risk"})
-        fig_scatter.update_layout(title="Amount vs Risk", margin=dict(t=40, b=30))
-        col2.plotly_chart(fig_scatter, width="stretch")
+            with col_wf:
+                st.subheader("Loss vs Savings Waterfall")
+                suspicious_val = float(fin_metrics.get("suspicious_txn_value", 0))
+                loss_detected = float(fin_metrics.get("potential_loss_detected", 0))
+                inv_cost = float(fin_metrics.get("investigation_cost", 0))
+                fp_cost = float(fin_metrics.get("false_positive_cost", 0))
 
-        col3, col4 = st.columns(2)
+                fig_wf = go.Figure(go.Waterfall(
+                    x=["Suspicious<br>Value", "Loss<br>Avoided", "Recovered",
+                       "Investigation<br>Cost", "FP Cost", "Net Savings"],
+                    y=[suspicious_val, -loss_detected, recovered,
+                       -inv_cost, -fp_cost, net_savings],
+                    measure=["absolute", "relative", "relative",
+                             "relative", "relative", "total"],
+                    connector_line_color="rgba(200,200,200,0.3)",
+                    increasing_marker_color=MODERN_TERMINAL_COLORS["green"],
+                    decreasing_marker_color=MODERN_TERMINAL_COLORS["red"],
+                    totals_marker_color=BLOOMBERG_COLORS["accent"],
+                    texttemplate="$%{y:,.0f}",
+                    textposition="outside",
+                ))
+                fig_wf.update_layout(
+                    yaxis_title="Amount ($)",
+                    height=350,
+                    margin=dict(t=40, b=30),
+                )
+                apply_modern_terminal_plotly()
+                st.plotly_chart(fig_wf, use_container_width=True)
 
-        # Volume by tx_type
-        type_vol = edges_df.groupby("tx_type")["base_amt"].sum().sort_values(ascending=True).reset_index()
-        type_vol["tx_type"] = type_vol["tx_type"].astype(str)
-        fig_type = px.bar(type_vol, y="tx_type", x="base_amt", orientation="h",
-                          color="base_amt", color_continuous_scale="Blues",
-                          labels={"base_amt": "Volume ($)", "tx_type": "Tx Type"})
-        fig_type.update_layout(title="Volume by Transaction Type", margin=dict(t=40, b=30))
-        col3.plotly_chart(fig_type, width="stretch")
+            # Money flow comparison: anomalous vs normal
+            if money_flow_path.exists():
+                try:
+                    money_df = pd.read_parquet(money_flow_path)
+                except Exception as e:
+                    st.warning(f"Could not load node_money_flow.parquet: {e}")
+                    money_df = None
 
-        # Risk heatmap
-        if nodes_df is not None and "source_type" in edges_df.columns:
-            hm = edges_df.pivot_table(values="edge_risk", index="source_type",
-                                      columns="target_type", aggfunc="mean").fillna(0)
-            fig_hm = px.imshow(hm, color_continuous_scale="RdYlGn_r",
-                               labels=dict(x="Target Type", y="Source Type", color="Avg Risk"),
-                               x=[f"Type {c}" for c in hm.columns],
-                               y=[f"Type {i}" for i in hm.index], text_auto=".3f")
-            fig_hm.update_layout(title="Avg Risk by Node-Type Pair", margin=dict(t=40, b=30))
-            col4.plotly_chart(fig_hm, width="stretch")
+                if money_df is not None and "is_anomaly" in money_df.columns:
+                    st.markdown("---")
+                    col_flow, col_risk_vol = st.columns(2)
 
-    # ── TAB 5: Node Risk Profiles ──
-    with stab5:
-        col1, col2 = st.columns(2)
+                    with col_flow:
+                        st.subheader("Money Flow: Anomalous vs Normal")
+                        anom = money_df[money_df["is_anomaly"] == True]
+                        norm = money_df[money_df["is_anomaly"] == False]
 
-        # Risk histogram with percentiles
-        fig_rh = go.Figure()
-        fig_rh.add_trace(go.Histogram(x=node_money["risk_score"], nbinsx=60,
-                                      marker_color=CLR["blue"], opacity=0.75))
-        for p, clr in [(50, "green"), (75, "yellow"), (90, "orange"), (95, "red"), (99, "darkred")]:
-            val = float(np.percentile(node_money["risk_score"], p))
-            fig_rh.add_vline(x=val, line_dash="dash", line_color=clr,
-                             annotation_text=f"P{p}: {val:.3f}")
-        fig_rh.update_layout(title="Risk Score Distribution", xaxis_title="Risk Score",
-                             yaxis_title="Nodes", margin=dict(t=40, b=30))
-        col1.plotly_chart(fig_rh, width="stretch")
+                        flow_metrics = ["total_volume", "outgoing_amt", "incoming_amt"]
+                        flow_labels = ["Total Volume", "Outgoing", "Incoming"]
+                        anom_means = [anom[m].mean() for m in flow_metrics]
+                        norm_means = [norm[m].mean() for m in flow_metrics]
 
-        # Volume vs risk scatter
-        fig_vr = px.scatter(node_money, x="total_volume", y="risk_score",
-                            color="is_anomaly", color_discrete_map={True: CLR["red"], False: CLR["blue"]},
-                            hover_data=["id", "total_volume", "total_transactions", "risk_score"],
-                            labels={"total_volume": "Volume ($)", "risk_score": "Risk Score", "is_anomaly": "Anomaly"})
-        fig_vr.update_layout(title="Volume vs Risk", margin=dict(t=40, b=30))
-        col2.plotly_chart(fig_vr, width="stretch")
+                        fig_flow = go.Figure()
+                        fig_flow.add_trace(go.Bar(
+                            x=flow_labels, y=anom_means, name="Anomalous",
+                            marker_color=MODERN_TERMINAL_COLORS["red"],
+                        ))
+                        fig_flow.add_trace(go.Bar(
+                            x=flow_labels, y=norm_means, name="Normal",
+                            marker_color=MODERN_TERMINAL_COLORS["green"],
+                        ))
+                        fig_flow.update_layout(
+                            barmode="group",
+                            yaxis_title="Avg Amount ($)",
+                            height=380,
+                            margin=dict(t=40, b=30),
+                            legend=dict(orientation="h", y=1.08),
+                        )
+                        apply_modern_terminal_plotly()
+                        st.plotly_chart(fig_flow, use_container_width=True)
 
-        # Top 20 table
-        st.subheader("Top 20 Highest Risk Nodes")
-        top20 = node_money.nlargest(20, "risk_score")[
-            ["id", "risk_score", "total_volume", "total_transactions", "is_anomaly", "net_flow"]].copy()
-        top20["risk_score"] = top20["risk_score"].round(4)
-        top20["total_volume"] = top20["total_volume"].apply(lambda x: f"${x:,.0f}")
-        top20["net_flow"] = top20["net_flow"].apply(lambda x: f"${x:,.0f}")
-        top20["total_transactions"] = top20["total_transactions"].astype(int)
-        st.dataframe(top20, width="stretch", hide_index=True)
+                    with col_risk_vol:
+                        st.subheader("Transaction Volume by Risk Category")
+                        if "risk_score" in money_df.columns:
+                            risk_labels = ["Low", "Medium", "High", "Critical"]
+                            risk_colors = [
+                                MODERN_TERMINAL_COLORS["green"],
+                                BLOOMBERG_COLORS["accent"],
+                                MODERN_TERMINAL_COLORS["amber"],
+                                MODERN_TERMINAL_COLORS["red"],
+                            ]
+                            money_df["risk_category"] = pd.cut(
+                                money_df["risk_score"],
+                                bins=[0, 0.25, 0.5, 0.75, 1.0],
+                                labels=risk_labels,
+                                include_lowest=True,
+                            )
+                            risk_vol = money_df.groupby("risk_category", observed=False)["total_volume"].sum()
+                            risk_vol = risk_vol.reindex(risk_labels).fillna(0)
 
-        col3, col4, col5 = st.columns(3)
+                            fig_risk = go.Figure(go.Bar(
+                                x=risk_labels,
+                                y=risk_vol.values,
+                                marker_color=risk_colors,
+                                text=[f"${v:,.0f}" for v in risk_vol.values],
+                                textposition="outside",
+                            ))
+                            fig_risk.update_layout(
+                                yaxis_title="Total Volume ($)",
+                                height=380,
+                                margin=dict(t=40, b=30),
+                            )
+                            apply_modern_terminal_plotly()
+                            st.plotly_chart(fig_risk, use_container_width=True)
+                        else:
+                            st.info("risk_score column not found in money flow data.")
+            else:
+                st.info(
+                    "node_money_flow.parquet not found. "
+                    "Money flow charts require notebook 07 output."
+                )
 
-        # Box plot by node type
-        if "type" in node_money.columns:
-            fig_box = px.box(node_money, x="type", y="risk_score",
-                             color="type", color_discrete_sequence=px.colors.qualitative.Set2,
-                             labels={"type": "Node Type", "risk_score": "Risk Score"})
-            fig_box.update_layout(title="Risk by Node Type", showlegend=False, margin=dict(t=40, b=30))
-            col3.plotly_chart(fig_box, width="stretch")
+    # ══════════════════════════════════════════════════════════════════════
+    #  Tab 3: Pattern Analysis (NB08 output)
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_patterns:
+        rules_path = results_dir / "aml_rules.json"
+        if not rules_path.exists():
+            st.warning(
+                "aml_rules.json not found in `results/`. "
+                "Run notebook 08 (pattern_analysis) to generate this file."
+            )
+        else:
+            try:
+                with open(rules_path) as f:
+                    rules_data = json.load(f)
+            except Exception as e:
+                st.error(f"Failed to load aml_rules.json: {e}")
+                return
 
-        # Radar chart
-        high_risk = node_money[node_money["risk_score"] > 0.75]
-        low_risk = node_money[node_money["risk_score"] <= 0.25]
-        radar_cats = ["Avg Volume", "Avg Txns", "Out Flow", "In Flow", "Net Flow Var"]
+            # Header KPIs from rules metadata
+            total_analyzed = rules_data.get("total_nodes_analyzed", 0)
+            anomalies_found = rules_data.get("anomalies_detected", 0)
+            rule_threshold = rules_data.get("anomaly_threshold", 0)
+            rules_list = rules_data.get("rules", [])
 
-        def _snorm(s, d):
-            return float(s.mean() / d) if d > 0 and len(s) > 0 else 0
+            kc1, kc2, kc3 = st.columns(3)
+            kc1.metric("Nodes Analyzed", f"{total_analyzed:,}")
+            kc2.metric("Anomalies Detected", f"{anomalies_found:,}")
+            kc3.metric("Rules Extracted", f"{len(rules_list):,}")
 
-        vm = node_money["total_volume"].max() or 1
-        tm = node_money["total_transactions"].max() or 1
-        om = node_money["outgoing_amt"].max() or 1
-        im_ = node_money["incoming_amt"].max() or 1
-        ns = node_money["net_flow"].std() or 1
+            st.markdown("---")
 
-        hv = [_snorm(high_risk["total_volume"], vm), _snorm(high_risk["total_transactions"], tm),
-              _snorm(high_risk["outgoing_amt"], om), _snorm(high_risk["incoming_amt"], im_),
-              float(high_risk["net_flow"].std() / ns) if len(high_risk) > 1 else 0]
-        lv = [_snorm(low_risk["total_volume"], vm), _snorm(low_risk["total_transactions"], tm),
-              _snorm(low_risk["outgoing_amt"], om), _snorm(low_risk["incoming_amt"], im_),
-              float(low_risk["net_flow"].std() / ns) if len(low_risk) > 1 else 0]
+            if not rules_list:
+                st.info("No rules were extracted in the pattern analysis.")
+            else:
+                # Build rules DataFrame
+                rules_rows = []
+                for r in rules_list:
+                    rate = r.get("suspicious_rate", 0)
+                    # Handle NaN rates (e.g. velocity rule with nan)
+                    try:
+                        rate = float(rate)
+                        if np.isnan(rate):
+                            rate = 0.0
+                    except (TypeError, ValueError):
+                        rate = 0.0
 
-        fig_radar = go.Figure()
-        fig_radar.add_trace(go.Scatterpolar(
-            r=hv + [hv[0]], theta=radar_cats + [radar_cats[0]],
-            fill="toself", name="High Risk", line_color=CLR["red"], fillcolor="rgba(231,76,60,0.2)"))
-        fig_radar.add_trace(go.Scatterpolar(
-            r=lv + [lv[0]], theta=radar_cats + [radar_cats[0]],
-            fill="toself", name="Low Risk", line_color=CLR["green"], fillcolor="rgba(46,204,113,0.2)"))
-        fig_radar.update_layout(title="Risk Profile Comparison",
-                                polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-                                margin=dict(t=50, b=30))
-        col4.plotly_chart(fig_radar, width="stretch")
+                    rules_rows.append({
+                        "Category": r.get("category", "N/A"),
+                        "Rule": r.get("rule", "N/A"),
+                        "Pattern": r.get("pattern", r.get("description", "N/A")),
+                        "Suspicious Rate": rate,
+                    })
 
-        # Lorenz curve
-        sorted_by_risk = node_money.sort_values("risk_score")
-        cum_vol = sorted_by_risk["total_volume"].cumsum() / sorted_by_risk["total_volume"].sum()
-        x_lorenz = np.linspace(0, 1, len(cum_vol))
-        fig_lorenz = go.Figure()
-        fig_lorenz.add_trace(go.Scatter(x=x_lorenz, y=cum_vol.values, fill="tonexty",
-                                        name="Actual", line_color=CLR["blue"],
-                                        fillcolor="rgba(52,152,219,0.2)"))
-        fig_lorenz.add_trace(go.Scatter(x=[0, 1], y=[0, 1], line_dash="dash",
-                                        name="Equal", line_color="grey"))
-        fig_lorenz.update_layout(title="Risk Concentration (Lorenz)",
-                                 xaxis_title="Cumulative % Nodes", yaxis_title="Cumulative % Volume",
-                                 margin=dict(t=40, b=30))
-        col5.plotly_chart(fig_lorenz, width="stretch")
+                rules_df = pd.DataFrame(rules_rows).sort_values(
+                    "Suspicious Rate", ascending=False
+                ).reset_index(drop=True)
+
+                # Rules table
+                st.subheader("Extracted Detection Rules")
+                display_df = rules_df.copy()
+                display_df["Suspicious Rate"] = display_df["Suspicious Rate"].apply(
+                    lambda x: f"{100 * x:.1f}%"
+                )
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+
+                # Rules bar chart ranked by effectiveness
+                st.subheader("Rules Ranked by Effectiveness")
+                chart_df = rules_df.head(15).copy()
+                chart_df["label"] = (
+                    chart_df["Category"].str[:3] + ": " + chart_df["Rule"].str[:40]
+                )
+                chart_df["rate_pct"] = chart_df["Suspicious Rate"] * 100
+
+                category_colors = {
+                    "AMOUNT": MODERN_TERMINAL_COLORS["green"],
+                    "NETWORK": MODERN_TERMINAL_COLORS["cyan"],
+                    "FREQUENCY": BLOOMBERG_COLORS["accent"],
+                }
+
+                fig_rules = go.Figure()
+                for cat in chart_df["Category"].unique():
+                    cat_data = chart_df[chart_df["Category"] == cat]
+                    fig_rules.add_trace(go.Bar(
+                        y=cat_data["label"],
+                        x=cat_data["rate_pct"],
+                        orientation="h",
+                        name=cat,
+                        marker_color=category_colors.get(cat, MODERN_TERMINAL_COLORS["muted"]),
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            "Suspicious Rate: %{x:.1f}%<extra></extra>"
+                        ),
+                    ))
+
+                fig_rules.update_layout(
+                    xaxis_title="Suspicious Rate (%)",
+                    yaxis=dict(autorange="reversed"),
+                    height=max(350, len(chart_df) * 30 + 80),
+                    margin=dict(t=40, b=30, l=220),
+                    legend=dict(orientation="h", y=1.08),
+                    barmode="group",
+                )
+                apply_modern_terminal_plotly()
+                st.plotly_chart(fig_rules, use_container_width=True)
 
 
 # --- Sidebar ---
@@ -2743,16 +2331,17 @@ def render_sidebar():
 
         with st.expander("📖 About"):
             st.markdown("""
-            **AML Pipeline Runner** v2.0
+            **AML Pipeline Runner** v2.1
 
             A web UI for running and monitoring
             the AML end-to-end detection pipeline.
 
             Features:
-            - Run profiles (Quick/Standard/Heavy)
+            - Multi-pipeline support (e2e-core, e2e-dashboards)
+            - Dataset profiles with sampling (Quick/Standard/Heavy/Full)
+            - Standalone simulation with Start/Stop/Reset
             - Real-time progress monitoring
-            - Interactive dashboard
-            - Report generation
+            - Interactive dashboards and reports
             """)
 
 
@@ -3736,6 +3325,373 @@ def render_aml_scores_tab():
             st.plotly_chart(fig_radar, width="stretch")
 
 
+# --- Simulation Tab ---
+
+
+def render_simulation_tab():
+    """Render the Simulation tab — live Start/Stop/Reset controls with real-time charts."""
+    apply_modern_terminal_plotly()
+
+    # ── Fetch current simulation status ────────────────────────
+    sim_status = api_request("GET", "/simulation/status") or {}
+    status = sim_status.get("status", "idle")
+
+    # ── Source Run Selection ───────────────────────────────────
+    st.subheader("Source Run")
+    st.caption("Select a completed pipeline run whose trained models power the simulation.")
+
+    source_runs_data = api_request("GET", "/runs/completed-sources?limit=15")
+    source_runs = source_runs_data.get("runs", []) if source_runs_data else []
+
+    source_run_id = None
+    if source_runs:
+        source_options = {
+            r["id"]: f"{r['id'][:8]}  |  {r.get('pipeline_name', '?')}  |  {r.get('dataset_mode', '?')}  |  {format_datetime(r.get('completed_at', ''))}"
+            for r in source_runs
+        }
+        source_run_id = st.selectbox(
+            "Completed run with trained models",
+            options=list(source_options.keys()),
+            format_func=lambda x: source_options[x],
+            key="sim_source_run_select",
+        )
+    else:
+        st.warning("No completed runs with trained models found. Run **e2e-core** or **e2e-dashboards** first.")
+
+    # ── Configuration Panel ────────────────────────────────────
+    with st.expander("Simulation Configuration", expanded=status == "idle"):
+        cfg1, cfg2, cfg3 = st.columns(3)
+        with cfg1:
+            num_batches = st.number_input("Batches", min_value=1, max_value=500, value=80, key="sim_batches")
+            batch_size = st.number_input("Batch Size", min_value=10, max_value=500, value=50, key="sim_batch_size")
+        with cfg2:
+            pattern_prob = st.slider("Pattern Probability", min_value=0.0, max_value=1.0, value=0.10, step=0.01, key="sim_pattern_prob")
+            batch_interval = st.slider("Batch Interval (s)", min_value=0.1, max_value=10.0, value=0.5, step=0.1, key="sim_interval")
+        with cfg3:
+            rescore_interval = st.number_input("Rescore Interval", min_value=1, max_value=50, value=3, key="sim_rescore")
+            threshold_pct = st.number_input("Threshold Percentile", min_value=80, max_value=100, value=99, key="sim_thresh")
+
+    # ── Control Buttons ────────────────────────────────────────
+    st.divider()
+    btn1, btn2, btn3, btn_spacer = st.columns([2, 2, 2, 6])
+
+    with btn1:
+        start_disabled = status not in ("idle", "finished", "stopped", "error") or not source_run_id
+        if st.button("START", type="primary", use_container_width=True, disabled=start_disabled):
+            result = api_request("POST", "/simulation/start", json={
+                "source_run_id": source_run_id,
+                "num_batches": num_batches,
+                "batch_size": batch_size,
+                "batch_interval": batch_interval,
+                "pattern_prob": pattern_prob,
+                "rescore_interval": rescore_interval,
+                "threshold_percentile": threshold_pct,
+                "seed": 42,
+            })
+            if result:
+                st.success(f"Simulation started: {result.get('sim_id', '')[:8]}")
+            else:
+                st.error("Failed to start simulation. Check API logs.")
+            st.rerun()
+
+    with btn2:
+        stop_disabled = status not in ("running", "starting")
+        if st.button("STOP", use_container_width=True, disabled=stop_disabled):
+            api_request("POST", "/simulation/stop")
+            st.rerun()
+
+    with btn3:
+        if st.button("RESET", use_container_width=True):
+            api_request("POST", "/simulation/reset")
+            st.rerun()
+
+    # ── Status Badge ───────────────────────────────────────────
+    status_colors = {
+        "idle": "#9CA3AF", "starting": "#FBBF24", "running": "#22C55E",
+        "stopping": "#FBBF24", "stopped": "#22D3EE", "finished": "#22D3EE", "error": "#EF4444",
+    }
+    badge_color = status_colors.get(status, "#9CA3AF")
+    st.markdown(
+        f'<div style="display:inline-block;padding:4px 14px;border-radius:12px;'
+        f'background:{badge_color}22;border:1px solid {badge_color};color:{badge_color};'
+        f'font-weight:600;font-size:0.9em;margin-bottom:8px;">{status.upper()}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Show error if any
+    if sim_status.get("error"):
+        st.error(f"Simulation error: {sim_status['error']}")
+
+    # ── KPI Metrics ────────────────────────────────────────────
+    if status not in ("idle",):
+        batch_num = sim_status.get("batch_num", 0)
+        total_batches = sim_status.get("total_batches", 0)
+        total_txns = sim_status.get("total_txns", 0)
+        total_alerts = sim_status.get("total_alerts", 0)
+        total_patterns = sim_status.get("total_patterns", 0)
+        elapsed = sim_status.get("elapsed", 0)
+        threshold = sim_status.get("threshold", 0)
+        confusion = sim_status.get("confusion", {})
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Batches", f"{batch_num}/{total_batches}")
+        k2.metric("Transactions", f"{total_txns:,}")
+        k3.metric("Alerts", f"{total_alerts:,}")
+        k4.metric("Patterns", f"{total_patterns}")
+        k5.metric("Duration", f"{elapsed:.1f}s")
+
+        # ── Status line ────────────────────────────────────────
+        last_info = sim_status.get("last_batch_info", "")
+        if last_info:
+            st.caption(last_info)
+
+        st.divider()
+
+        # ── Score Time Series + Alert Feed ─────────────────────
+        score_history = sim_status.get("score_history", [])
+        recent_alerts = sim_status.get("recent_alerts", [])
+
+        col_ts, col_alert = st.columns([7, 5])
+
+        with col_ts:
+            if score_history:
+                # score_history is list of tuples: (batch, mean, max, n_alerts)
+                sh_df = pd.DataFrame(score_history, columns=["batch", "mean", "max", "n_alerts"])
+                fig_ts = go.Figure()
+                fig_ts.add_trace(go.Scatter(
+                    x=sh_df["batch"], y=sh_df["mean"],
+                    mode="lines", name="Mean Score",
+                    fill="tozeroy", fillcolor="rgba(52,152,219,0.15)",
+                    line=dict(width=2),
+                ))
+                fig_ts.add_trace(go.Scatter(
+                    x=sh_df["batch"], y=sh_df["max"],
+                    mode="lines", name="Max Score",
+                    line=dict(width=1, dash="dot"),
+                ))
+                if threshold > 0:
+                    fig_ts.add_hline(
+                        y=threshold, line_dash="dash",
+                        annotation_text=f"Threshold={threshold:.2f}",
+                    )
+                # Alert markers
+                alert_rows = sh_df[sh_df["n_alerts"] > 0]
+                if len(alert_rows) > 0:
+                    fig_ts.add_trace(go.Scatter(
+                        x=alert_rows["batch"], y=alert_rows["max"],
+                        mode="markers", name="Alert Batch",
+                        marker=dict(size=8, symbol="triangle-down", color="#E74C3C"),
+                    ))
+                fig_ts.update_layout(
+                    title="Score Time Series (Live)",
+                    xaxis_title="Batch", yaxis_title="Anomaly Score",
+                    height=350,
+                    margin=dict(t=40, b=30, l=50, r=10),
+                    legend=dict(orientation="h", y=-0.18),
+                )
+                st.plotly_chart(fig_ts, use_container_width=True)
+            else:
+                st.caption("Waiting for score data...")
+
+        with col_alert:
+            st.markdown("**Recent Alerts**")
+            if recent_alerts:
+                alert_df = pd.DataFrame(recent_alerts)
+                st.dataframe(alert_df.tail(20), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No alerts yet.")
+
+        # ── Confusion Matrix + Score Histogram ─────────────────
+        col_cm, col_hist = st.columns([5, 7])
+
+        with col_cm:
+            tp = confusion.get("tp", 0)
+            fp = confusion.get("fp", 0)
+            fn = confusion.get("fn", 0)
+            tn = confusion.get("tn", 0)
+
+            if tp + fp + fn + tn > 0:
+                cm_array = np.array([[tn, fp], [fn, tp]])
+                fig_cm = go.Figure(data=go.Heatmap(
+                    z=cm_array,
+                    x=["Pred: Normal", "Pred: Anomaly"],
+                    y=["Actual: Normal", "Actual: SAR"],
+                    text=[[f"{cm_array[i][j]:,}" for j in range(2)] for i in range(2)],
+                    texttemplate="%{text}",
+                    textfont={"size": 16},
+                    colorscale="YlOrRd",
+                    showscale=False,
+                ))
+                fig_cm.update_layout(
+                    title="Confusion Matrix",
+                    height=350,
+                    margin=dict(t=40, b=30, l=100, r=10),
+                )
+                st.plotly_chart(fig_cm, use_container_width=True)
+
+                # Detection KPIs
+                precision = tp / max(tp + fp, 1)
+                recall = tp / max(tp + fn, 1)
+                f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+                dk1, dk2, dk3 = st.columns(3)
+                dk1.metric("Precision", f"{precision:.4f}")
+                dk2.metric("Recall", f"{recall:.4f}")
+                dk3.metric("F1 Score", f"{f1:.4f}")
+            else:
+                st.caption("No detection data yet.")
+
+        with col_hist:
+            all_scores = sim_status.get("all_scores", [])
+            sar_labels = sim_status.get("sar_labels", [])
+            if all_scores:
+                scores_arr = np.array(all_scores)
+                labels_arr = np.array(sar_labels) if sar_labels else np.zeros(len(all_scores))
+                fig_hist = go.Figure()
+                normal_mask = labels_arr == 0
+                sar_mask = labels_arr == 1
+                if normal_mask.any():
+                    fig_hist.add_trace(go.Histogram(
+                        x=scores_arr[normal_mask], name="Normal",
+                        nbinsx=50, opacity=0.6, marker_color="#3498DB",
+                    ))
+                if sar_mask.any():
+                    fig_hist.add_trace(go.Histogram(
+                        x=scores_arr[sar_mask], name="SAR",
+                        nbinsx=50, opacity=0.7, marker_color="#E74C3C",
+                    ))
+                if threshold > 0:
+                    fig_hist.add_vline(
+                        x=threshold, line_dash="dash", line_color="#FBBF24",
+                        annotation_text=f"Threshold={threshold:.2f}",
+                    )
+                fig_hist.update_layout(
+                    title="Score Distribution (Normal vs SAR)",
+                    xaxis_title="Anomaly Score", yaxis_title="Count",
+                    barmode="overlay", height=350,
+                    margin=dict(t=40, b=30),
+                    legend=dict(orientation="h", y=-0.18),
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+            else:
+                st.caption("Waiting for score distribution data...")
+
+        # ── Latency Analysis ───────────────────────────────────
+        latency_history = sim_status.get("latency_history", [])
+        if len(latency_history) > 1:
+            st.divider()
+            # latency_history is a list of floats (latency values in ms)
+            lat_arr = np.array(latency_history)
+            batch_nums = list(range(1, len(lat_arr) + 1))
+            col_bar, col_lhist = st.columns(2)
+
+            with col_bar:
+                fig_bar = go.Figure(go.Bar(
+                    x=batch_nums, y=lat_arr,
+                    marker_color="#3498DB", opacity=0.7,
+                ))
+                mean_lat = float(lat_arr.mean())
+                fig_bar.add_hline(
+                    y=mean_lat, line_dash="dash",
+                    annotation_text=f"Mean: {mean_lat:.0f}ms",
+                )
+                fig_bar.update_layout(
+                    title="Scoring Latency per Batch",
+                    xaxis_title="Batch", yaxis_title="Latency (ms)",
+                    height=380, margin=dict(t=40, b=30),
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+            with col_lhist:
+                p95 = float(np.percentile(lat_arr, 95))
+                fig_lhist = go.Figure(go.Histogram(
+                    x=lat_arr, nbinsx=30, opacity=0.7,
+                ))
+                fig_lhist.add_vline(x=p95, line_dash="dash", line_color="#E74C3C",
+                                    annotation_text=f"P95: {p95:.0f}ms")
+                fig_lhist.add_vline(x=mean_lat, line_dash="dash", line_color="#2ECC71",
+                                    annotation_text=f"Mean: {mean_lat:.0f}ms")
+                fig_lhist.update_layout(
+                    title="Latency Distribution",
+                    xaxis_title="Latency (ms)", yaxis_title="Count",
+                    height=380, margin=dict(t=40, b=30),
+                )
+                st.plotly_chart(fig_lhist, use_container_width=True)
+
+            # Latency KPIs
+            lk1, lk2, lk3, lk4 = st.columns(4)
+            lk1.metric("Mean Latency", f"{mean_lat:.0f}ms")
+            lk2.metric("P95 Latency", f"{p95:.0f}ms")
+            throughput = total_txns / max(elapsed, 0.01)
+            lk3.metric("Throughput", f"{throughput:.0f} txns/s")
+            pattern_nodes = sim_status.get("pattern_nodes", 0)
+            lk4.metric("Pattern Nodes", f"{pattern_nodes}")
+
+    # ── Post-Simulation Analysis (shown when stopped/finished) ──────
+    if status in ("stopped", "finished"):
+        st.divider()
+        st.subheader("Post-Simulation Analysis")
+
+        # Summary metrics
+        cm = confusion
+        tp, fp, fn, tn = cm.get("tp", 0), cm.get("fp", 0), cm.get("fn", 0), cm.get("tn", 0)
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Duration", f"{elapsed:.1f}s")
+        throughput = total_txns / max(elapsed, 0.01)
+        s2.metric("Throughput", f"{throughput:.0f} txns/s")
+        s3.metric("Precision", f"{precision:.4f}")
+        s4.metric("Recall", f"{recall:.4f}")
+        s5.metric("F1 Score", f"{f1:.4f}")
+        if latency_history:
+            p95_lat = float(np.percentile(latency_history, 95))
+            s6.metric("P95 Latency", f"{p95_lat:.0f}ms")
+        else:
+            s6.metric("P95 Latency", "--")
+
+        # Saved results location
+        sim_id = sim_status.get("sim_id", "")
+        if sim_id:
+            st.caption(f"Results saved to: `artifacts/simulations/{sim_id}/`")
+
+        # Investigation section (top alert)
+        st.divider()
+        st.subheader("Investigation")
+
+        recent_alerts = sim_status.get("recent_alerts", [])
+        if recent_alerts:
+            # Find top alert by score
+            top_alert = max(recent_alerts, key=lambda a: a.get("score", 0))
+            inv1, inv2 = st.columns([3, 9])
+
+            with inv1:
+                st.markdown("**Top Alert Node**")
+                st.metric("Node ID", top_alert.get("node_id", "N/A")[:12])
+                st.metric("Score", f"{top_alert.get('score', 0):.4f}")
+                st.metric("SAR", "Yes" if top_alert.get("is_sar") else "No")
+                st.metric("Batch", str(top_alert.get("batch", "--")))
+
+            with inv2:
+                st.markdown("**Alert Details**")
+                # Show all alerts in a table
+                alert_df = pd.DataFrame(recent_alerts)
+                if len(alert_df) > 0:
+                    alert_df = alert_df.sort_values("score", ascending=False)
+                    display_cols = ["batch", "node_id", "score", "is_sar", "timestamp"]
+                    display_cols = [c for c in display_cols if c in alert_df.columns]
+                    st.dataframe(alert_df[display_cols].head(20), use_container_width=True, hide_index=True)
+        else:
+            st.info("No alerts generated during simulation.")
+
+    # ── Auto-refresh for active simulation ─────────────────────
+    if status in ("running", "starting", "stopping"):
+        st.info(f"Simulation {status}. Auto-refreshing every {POLL_INTERVAL} seconds...")
+        time.sleep(POLL_INTERVAL)
+        st.rerun()
+
+
 # --- Main ---
 
 def main():
@@ -3743,10 +3699,10 @@ def main():
     render_sidebar()
 
     # Tab navigation
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-        "🚀 Run", "📊 Status", "📈 Dashboard", "🔬 Analytics",
-        "📄 Report", "🎛 Interactive", "⚡ Tier Queue", "🧩 Cases",
-        "🎯 AML Scores",
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+        "🚀 Run", "📊 Status", "📈 Dashboard", "🔬 Graph & Scoring",
+        "📄 Report", "🗃 Tables", "⚡ Tier Queue",
+        "🧩 Cases", "🎯 AML Scores", "🎮 Simulation",
     ])
 
     with tab1:
@@ -3759,13 +3715,13 @@ def main():
         render_dashboard_tab()
 
     with tab4:
-        render_analytics_tab()
+        render_graph_scoring_tab()
 
     with tab5:
         render_report_tab()
 
     with tab6:
-        render_interactive_dashboard_tab()
+        render_tables_tab()
 
     with tab7:
         render_tier_queue_tab()
@@ -3775,6 +3731,9 @@ def main():
 
     with tab9:
         render_aml_scores_tab()
+
+    with tab10:
+        render_simulation_tab()
 
 
 if __name__ == "__main__":

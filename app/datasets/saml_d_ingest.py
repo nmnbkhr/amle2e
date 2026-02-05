@@ -202,7 +202,7 @@ def _write_meta(prepared_dir: Path, result: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def query_large_table(
-    parquet_path: Path,
+    file_path: Path,
     offset: int = 0,
     limit: int = 200,
     columns: Optional[str] = None,
@@ -210,12 +210,12 @@ def query_large_table(
     order_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    DuckDB-based pagination for large parquet tables.
+    DuckDB-based pagination for large parquet or CSV tables.
 
     Safe for 9.5M-row files — never loads full table into memory.
 
     Args:
-        parquet_path: Path to the parquet file
+        file_path: Path to the parquet or CSV file
         offset: Skip first N rows
         limit: Max rows to return (capped at 2000)
         columns: Comma-separated column names (None = all)
@@ -223,17 +223,24 @@ def query_large_table(
         order_by: SQL ORDER BY clause (no ORDER BY keyword)
 
     Returns:
-        {"total": int, "rows": list[dict], "limit": int, "offset": int}
+        {"total": int, "columns": list[str], "rows": list[dict],
+         "limit": int, "offset": int}
     """
     import duckdb
 
+    file_path = Path(file_path)
     limit = min(limit, 2000)  # hard cap
 
     con = duckdb.connect(database=":memory:")
     con.execute("SET memory_limit = '512MB'")
 
     try:
-        base = f"read_parquet('{parquet_path}')"
+        ext = file_path.suffix.lower()
+        if ext == ".csv":
+            base = f"read_csv_auto('{file_path}')"
+        else:
+            base = f"read_parquet('{file_path}')"
+
         col_clause = columns if columns else "*"
         where_clause = f"WHERE {where}" if where else ""
         order_clause = f"ORDER BY {order_by}" if order_by else ""
@@ -251,6 +258,7 @@ def query_large_table(
 
         return {
             "total": total,
+            "columns": list(rows_df.columns),
             "rows": rows_df.to_dict(orient="records"),
             "limit": limit,
             "offset": offset,
