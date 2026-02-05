@@ -602,6 +602,182 @@ def api_request(method: str, endpoint: str, timeout: int = 30, **kwargs) -> dict
         return None
 
 
+# ---------------------------------------------------------------------------
+# Role Map constants & helpers
+# ---------------------------------------------------------------------------
+
+ROLE_COLORS = {
+    "Ingest": "#3B82F6",
+    "Features": "#8B5CF6",
+    "Embeddings": "#EC4899",
+    "GAN": "#EF4444",
+    "Scoring": "#F59E0B",
+    "Eval": "#10B981",
+    "Dashboards": "#06B6D4",
+    "Realtime": "#6366F1",
+    "Other": "#6B7280",
+}
+
+_DEFAULT_ROLE_ORDER = [
+    "Ingest", "Features", "Embeddings", "GAN",
+    "Scoring", "Eval", "Dashboards", "Realtime", "Other",
+]
+
+
+@st.cache_data(ttl=30)
+def _cached_pipeline_detail(pipeline_name: str, dataset_mode: str):
+    """Fetch pipeline detail with role data (cached 30s)."""
+    return api_request("GET", f"/pipelines/{pipeline_name}?dataset_mode={dataset_mode}")
+
+
+@st.cache_data(ttl=30)
+def _cached_pipeline_manifest(run_id: str):
+    """Fetch pipeline manifest for a completed run (cached 30s). Returns None on 404."""
+    return api_request("GET", f"/runs/{run_id}/pipeline-manifest")
+
+
+def _resolve_role_map_data(
+    selected_pipeline: str,
+    dataset_mode: str,
+    active_run_id: str = None,
+):
+    """
+    Resolve role map data: prefer run manifest if available, else pipeline detail.
+
+    Returns (steps, role_order, role_counts, excluded, source_label) or Nones.
+    """
+    # Try manifest first if a run is selected
+    if active_run_id:
+        manifest = _cached_pipeline_manifest(active_run_id)
+        if manifest and manifest.get("steps"):
+            return (
+                manifest["steps"],
+                manifest.get("role_order", _DEFAULT_ROLE_ORDER),
+                manifest.get("role_counts", {}),
+                [],  # manifest has no excluded list (it's the truth)
+                f"run manifest ({active_run_id[:8]}…)",
+            )
+
+    # Fallback: pipeline detail endpoint
+    detail = _cached_pipeline_detail(selected_pipeline, dataset_mode)
+    if detail and detail.get("steps"):
+        return (
+            detail["steps"],
+            detail.get("role_order", _DEFAULT_ROLE_ORDER),
+            detail.get("role_counts", {}),
+            detail.get("excluded_notebooks", []),
+            "pipeline resolver",
+        )
+
+    return None, None, None, None, None
+
+
+def render_role_ribbon(role_order, role_counts):
+    """Render a horizontal ribbon of colored role pills with counts."""
+    parts = []
+    for role in role_order:
+        count = role_counts.get(role, 0)
+        color = ROLE_COLORS.get(role, "#6B7280")
+        if count > 0:
+            parts.append(
+                f'<span style="display:inline-block;padding:4px 12px;margin:2px 4px;'
+                f'border-radius:14px;background:{color};color:#fff;font-size:0.8em;'
+                f'font-weight:600;">{role} ({count})</span>'
+            )
+        else:
+            parts.append(
+                f'<span style="display:inline-block;padding:4px 12px;margin:2px 4px;'
+                f'border-radius:14px;background:#1F2937;color:#6B7280;font-size:0.8em;'
+                f'border:1px solid #374151;">{role}</span>'
+            )
+    ribbon_html = ' <span style="color:#4B5563;">&#x2192;</span> '.join(parts)
+    st.markdown(
+        f'<div style="padding:8px 0;overflow-x:auto;white-space:nowrap;">{ribbon_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_mermaid_flow(steps):
+    """Render a Mermaid LR flowchart with role-colored nodes."""
+    lines = ["graph LR"]
+    for i, s in enumerate(steps):
+        node_id = f"S{s['number']}"
+        label = s["name"]
+        role = s.get("role", "Other")
+        if s.get("optional"):
+            lines.append(f"    {node_id}[/{label}/]:::{role}")
+        else:
+            lines.append(f"    {node_id}[{label}]:::{role}")
+        if i > 0:
+            prev_id = f"S{steps[i - 1]['number']}"
+            lines.append(f"    {prev_id} --> {node_id}")
+    for role, color in ROLE_COLORS.items():
+        lines.append(f"    classDef {role} fill:{color},stroke:#fff,color:#fff;")
+    st.markdown(f"```mermaid\n" + "\n".join(lines) + "\n```")
+
+
+def render_grouped_steps(steps, role_order):
+    """Render steps grouped by role in pipeline order."""
+    from collections import OrderedDict
+
+    groups = OrderedDict()
+    for role in role_order:
+        role_steps = [s for s in steps if s.get("role") == role]
+        if role_steps:
+            groups[role] = role_steps
+
+    for role, group_steps in groups.items():
+        color = ROLE_COLORS.get(role, "#6B7280")
+        st.markdown(
+            f'<div style="margin:6px 0 2px 0;">'
+            f'<span style="color:{color};font-weight:700;">{role}</span>'
+            f' <span style="color:#6B7280;font-size:0.85em;">'
+            f'({len(group_steps)} step{"s" if len(group_steps) != 1 else ""})</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        for s in group_steps:
+            opt = " *(optional)*" if s.get("optional") else ""
+            st.markdown(f'&nbsp;&nbsp;&nbsp;&nbsp;`{s["number"]:02d}` {s["notebook"]}{opt}')
+
+
+def render_excluded_notebooks(excluded):
+    """Render the list of notebooks excluded from this pipeline variant."""
+    if not excluded:
+        return
+    st.markdown("---")
+    st.markdown(
+        '<span style="color:#9CA3AF;font-size:0.85em;">'
+        "Available but excluded from this pipeline variant:</span>",
+        unsafe_allow_html=True,
+    )
+    for ex in excluded:
+        st.markdown(
+            f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#6B7280;">'
+            f'`{ex["notebook"]}` — {ex.get("role", "")}</span>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_step_details_table(steps):
+    """Render an expandable step details table."""
+    with st.expander("Step details (table)"):
+        rows = [
+            {
+                "Step": s["number"],
+                "Role": s.get("role", ""),
+                "Notebook": s["notebook"],
+                "Name": s["name"],
+                "Optional": "Yes" if s.get("optional") else "",
+            }
+            for s in steps
+        ]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+
+
 def format_datetime(dt_str: str) -> str:
     """Format ISO datetime string for display."""
     if not dt_str:
@@ -641,7 +817,7 @@ def get_status_emoji(status: str) -> str:
 # --- Run Tab ---
 
 def render_run_tab():
-    """Render the Run tab with profile selection."""
+    """Render the Run tab with pipeline, dataset, sampling, and profile selection."""
     st.header("Start New Pipeline Run")
 
     # Fetch available profiles
@@ -653,8 +829,50 @@ def render_run_tab():
 
     profiles = {p["name"]: p for p in profiles_data.get("profiles", [])}
 
+    # ── Pipeline Selection ──────────────────────────────────────────
+    st.subheader("Pipeline")
+
+    pipelines_data = api_request("GET", "/pipelines")
+    pipeline_options = {}
+    if pipelines_data:
+        for p in pipelines_data.get("pipelines", []):
+            pipeline_options[p["name"]] = p
+    else:
+        # Fallback if API not yet updated
+        pipeline_options = {
+            "legacy-root": {"name": "legacy-root", "display_name": "Legacy Hopsworks Pipeline",
+                            "description": "Original 12-step pipeline in project root"},
+            "e2e-core": {"name": "e2e-core", "display_name": "E2E PyTorch Core",
+                         "description": "GraphSAGE + WGAN-GP core (01-08)"},
+            "e2e-dashboards": {"name": "e2e-dashboards", "display_name": "E2E + Dashboards",
+                               "description": "Core + interactive & analytics dashboards (09, 10)"},
+            "e2e-realtime": {"name": "e2e-realtime", "display_name": "E2E Real-Time Only",
+                             "description": "Real-time simulation (11, 12) — requires prior core run"},
+        }
+
+    pip_cols = st.columns(len(pipeline_options))
+    selected_pipeline = st.session_state.get("selected_pipeline", "legacy-root")
+
+    for idx, (pname, pinfo) in enumerate(pipeline_options.items()):
+        with pip_cols[idx]:
+            is_sel = pname == selected_pipeline
+            border = "var(--cyan, #22D3EE)" if is_sel else "var(--border, #243042)"
+            st.markdown(f"""
+            <div style="border: 2px solid {border}; padding: 12px; border-radius: 8px; min-height: 110px;">
+                <h4 style="margin:0; font-size:0.95em;">{pinfo.get('display_name', pname)}</h4>
+                <p style="color: var(--muted, #9CA3AF); font-size: 0.8em; margin: 4px 0 0 0;">
+                    {pinfo.get('description', '')}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button(f"Select", key=f"sel_pipe_{pname}",
+                        type="primary" if is_sel else "secondary"):
+                st.session_state["selected_pipeline"] = pname
+                st.rerun()
+
     # Profile selection with descriptions
-    st.subheader("Select Run Profile")
+    st.divider()
+    st.subheader("Run Profile")
 
     profile_cols = st.columns(3)
 
@@ -687,28 +905,81 @@ def render_run_tab():
     if selected_profile == "heavy":
         st.warning("**Heavy profile requires 12GB+ VRAM.** Make sure your system has sufficient resources.")
 
-    # Data source selection
+    # ── Dataset Selection ───────────────────────────────────────────
     st.divider()
-    st.subheader("Data Source")
+    st.subheader("Dataset")
 
-    data_source = st.radio(
+    datasets_data = api_request("GET", "/datasets")
+    ds_options = {}
+    if datasets_data:
+        for d in datasets_data.get("datasets", []):
+            ds_options[d["name"]] = d
+    else:
+        ds_options = {
+            "demodata": {"name": "demodata", "display_name": "Demo Data",
+                         "description": "local demodata/ (~67K txns)",
+                         "approx_rows": 67000, "default_sampling": "Full"},
+            "simulate": {"name": "simulate", "display_name": "Generate Synthetic",
+                         "description": "Fresh synthetic data via 00_simulate_transactions",
+                         "approx_rows": None, "default_sampling": "Full"},
+            "saml-d": {"name": "saml-d", "display_name": "SAML-D (9.5M rows)",
+                       "description": "/mnt/e/xx/demodata/ (realistic AML dataset)",
+                       "approx_rows": 9500000, "default_sampling": "Quick"},
+        }
+
+    dataset_mode = st.radio(
         "Select dataset",
-        options=["demo-data", "saml-d"],
-        format_func=lambda x: {
-            "demo-data": "Demo Data  —  local demodata/ (small synthetic dataset)",
-            "saml-d": "SAML-D  —  /mnt/e/xx/demodata/ (9.5M real transactions)",
-        }[x],
+        options=list(ds_options.keys()),
+        format_func=lambda x: f"{ds_options[x].get('display_name', x)}  —  {ds_options[x].get('description', '')}",
         horizontal=True,
-        key="data_source_select",
+        key="dataset_mode_select",
     )
+
+    # ── Sampling Profile ────────────────────────────────────────────
+    ds_info = ds_options.get(dataset_mode, {})
+    approx = ds_info.get("approx_rows")
+    default_sampling = ds_info.get("default_sampling", "Standard")
+    sampling_profiles = ds_info.get("sampling_profiles", ["Quick", "Standard", "Heavy", "Full"])
+
+    sampling_col1, sampling_col2 = st.columns([2, 3])
+    with sampling_col1:
+        sampling_profile = st.selectbox(
+            "Sampling profile",
+            options=sampling_profiles if isinstance(sampling_profiles, list) else ["Quick", "Standard", "Heavy", "Full"],
+            index=0,
+            key="sampling_profile_select",
+            help="Quick=200K, Standard=1M, Heavy=3M, Full=all rows",
+        )
+        # Default the selectbox to the dataset's default if not yet interacted
+        if "sampling_profile_init" not in st.session_state:
+            st.session_state["sampling_profile_init"] = True
+
+    with sampling_col2:
+        if approx and approx > 500_000:
+            st.info(f"Large dataset (~{approx:,} rows). Default sampling: {default_sampling}")
+
+    # Full confirm checkbox (guardrail)
+    confirm_full = False
+    if sampling_profile == "Full" and approx and approx > 500_000:
+        st.warning(f"Full sampling on ~{approx:,} rows. This may take a long time and use significant resources.")
+        confirm_full = st.checkbox(
+            "I confirm I want to run Full sampling on this large dataset",
+            value=False,
+            key="confirm_full_check",
+        )
+
+    # /mnt path warning
+    ds_root = ds_info.get("dataset_root", "")
+    if isinstance(ds_root, str) and ds_root.startswith("/mnt"):
+        st.warning("Data is on /mnt/ (Windows mount). IO will be slow. Parquet caching on Linux recommended.")
 
     custom_data_path = None
     with st.expander("Custom data path (optional)"):
         custom_data_path = st.text_input(
-            "Override data path",
+            "Override dataset root path",
             value="",
             placeholder="/path/to/your/demodata/",
-            help="Leave empty to use the default path for the selected data source",
+            help="Leave empty to use the default path for the selected dataset",
         )
         if custom_data_path:
             st.info(f"Custom path: `{custom_data_path}`")
@@ -743,11 +1014,17 @@ def render_run_tab():
     # Start button
     st.divider()
 
-    if st.button("🚀 Start Pipeline Run", type="primary", width="stretch"):
+    # Block start if Full not confirmed
+    start_disabled = (sampling_profile == "Full" and approx and approx > 500_000 and not confirm_full)
+
+    if st.button("Start Pipeline Run", type="primary", use_container_width=True, disabled=start_disabled):
         with st.spinner("Starting pipeline run..."):
             params = {
+                "pipeline_name": selected_pipeline,
                 "profile": selected_profile,
-                "data_source": data_source,
+                "dataset_mode": dataset_mode,
+                "sampling_profile": sampling_profile,
+                "confirm_full": confirm_full,
                 "skip_hyperparameter_tuning": skip_hp,
                 "generate_visualizations": gen_viz,
                 "generate_report": gen_report,
@@ -756,7 +1033,7 @@ def render_run_tab():
 
             # Add data path override if specified
             if custom_data_path:
-                params["data_path"] = custom_data_path
+                params["dataset_root"] = custom_data_path
 
             # Add custom overrides if specified
             if custom_sample:
@@ -774,6 +1051,37 @@ def render_run_tab():
             else:
                 st.error("Failed to start pipeline. Check if the API and Celery worker are running.")
 
+    if start_disabled:
+        st.caption("Enable the confirmation checkbox above to start with Full sampling.")
+
+    # ── Pipeline Map with Role Categories ─────────────────────────────
+    with st.expander("Pipeline Map"):
+        active_run_id = st.session_state.get("active_run_id")
+        steps, role_order, role_counts, excluded, source_label = _resolve_role_map_data(
+            selected_pipeline, dataset_mode, active_run_id,
+        )
+
+        if steps:
+            st.caption(f"Source: **{source_label}**")
+
+            # Role ribbon
+            render_role_ribbon(role_order, role_counts)
+
+            # Mermaid flowchart (colored by role)
+            render_mermaid_flow(steps)
+
+            # Grouped steps by role
+            st.markdown("**Steps by Role**")
+            render_grouped_steps(steps, role_order)
+
+            # Excluded notebooks (if e2e variant)
+            render_excluded_notebooks(excluded)
+
+            # Step details table
+            render_step_details_table(steps)
+        else:
+            st.info("Pipeline details not available (API may need updating).")
+
     # Recent runs
     st.divider()
     st.subheader("Recent Runs")
@@ -783,17 +1091,22 @@ def render_run_tab():
         for run in runs:
             status = run["status"]
             emoji = get_status_emoji(status)
+            run_params = run.get("params", {})
+            run_pipeline = run_params.get("pipeline_name", "legacy-root")
+            run_ds = run_params.get("dataset_mode", run_params.get("data_source", "demodata"))
 
-            col1, col2, col3, col4, col5 = st.columns([3, 1.5, 2, 1.5, 1])
+            col1, col2, col3, col4, col5, col6 = st.columns([3, 1.2, 1, 1.5, 1.5, 1])
             with col1:
                 st.markdown(f"`{run['id'][:12]}...`")
             with col2:
-                st.markdown(f"{emoji} **{status.upper()}**")
+                st.markdown(f"`{run_pipeline}`")
             with col3:
-                st.markdown(format_datetime(run["created_at"]))
+                st.markdown(f"`{run_ds}`")
             with col4:
-                st.markdown(f"{run['progress_percent']:.0f}%")
+                st.markdown(f"{emoji} **{status.upper()}**")
             with col5:
+                st.markdown(f"{run['progress_percent']:.0f}%")
+            with col6:
                 if st.button("View", key=f"view_{run['id']}"):
                     st.session_state["active_run_id"] = run["id"]
                     st.rerun()

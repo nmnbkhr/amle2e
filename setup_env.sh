@@ -9,7 +9,7 @@
 #
 # What this script does:
 #   1. Checks prerequisites (conda, Python >= 3.10)
-#   2. Creates (or updates) a conda environment named "amlgan"
+#   2. Creates (or updates) a conda environment named "amgan2"
 #   3. Installs all Python dependencies from requirements.txt
 #   4. Installs the project in editable mode (pip install -e .)
 #   5. Installs Redis server (via apt or conda)
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────────
-ENV_NAME="amlgan"
+ENV_NAME="amgan2"
 PYTHON_VERSION="3.10"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GPU=false

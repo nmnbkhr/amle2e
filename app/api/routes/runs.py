@@ -48,16 +48,39 @@ def _resolve_artifact_dir(run: PipelineRun) -> Path:
 # Request/Response Models
 class RunParams(BaseModel):
     """Parameters for starting a pipeline run"""
+    pipeline_name: str = Field(
+        default="legacy-root",
+        description="Pipeline: legacy-root, e2e-core, e2e-dashboards, e2e-realtime",
+    )
     profile: str = Field(default="standard", description="Run profile: quick, standard, heavy")
-    data_source: str = Field(default="demo-data", description="Data source: demo-data or saml-d")
-    data_path: Optional[str] = Field(default=None, description="Custom data path override")
-    sample_size: Optional[int] = Field(default=None, description="Override sample size")
+    dataset_mode: str = Field(
+        default="demodata",
+        description="Dataset mode: demodata, simulate, saml-d",
+    )
+    dataset_root: Optional[str] = Field(
+        default=None,
+        description="Override dataset root path (absolute or relative to repo root)",
+    )
+    sampling_profile: Optional[str] = Field(
+        default=None,
+        description="Sampling profile: Quick (200K), Standard (1M), Heavy (3M), Full (all)",
+    )
+    max_rows: Optional[int] = Field(
+        default=None,
+        description="Explicit max_rows override (takes precedence over sampling_profile)",
+    )
+    confirm_full: bool = Field(
+        default=False,
+        description="Required confirmation when sampling_profile=Full on large datasets",
+    )
+    sample_size: Optional[int] = Field(default=None, description="Override sample size (legacy)")
     epochs: Optional[int] = Field(default=None, description="Override epochs")
     threshold: Optional[float] = Field(default=None, description="Override anomaly threshold")
     notebook_timeout: Optional[int] = Field(default=None, description="Timeout per notebook (seconds)")
     skip_hyperparameter_tuning: bool = Field(default=True, description="Skip Maggy HP tuning")
     generate_visualizations: bool = Field(default=True, description="Generate visualizations")
     generate_report: bool = Field(default=True, description="Generate HTML report")
+    seed: Optional[int] = Field(default=None, description="Random seed for reproducibility")
 
 
 class RunResponse(BaseModel):
@@ -133,14 +156,55 @@ def create_run(
     Creates a new run record in the database and enqueues a Celery task
     to execute the pipeline in the background.
     """
+    # Validate pipeline name
+    try:
+        from ...pipeline_runner.pipeline_registry import get_pipeline as _get_pipe
+        _get_pipe(params.pipeline_name)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Validate dataset mode
+    try:
+        from ...datasets.dataset_registry import get_dataset as _get_ds
+        ds = _get_ds(params.dataset_mode)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Validate sampling profile
+    if params.sampling_profile:
+        from ...datasets.dataset_registry import SAMPLING_PROFILES
+        if params.sampling_profile not in SAMPLING_PROFILES:
+            valid = ", ".join(SAMPLING_PROFILES.keys())
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sampling_profile '{params.sampling_profile}'. Valid: {valid}",
+            )
+
+    # Guardrail: Full sampling on large datasets requires confirm_full
+    effective_profile = params.sampling_profile or ds.default_sampling
+    if effective_profile == "Full" and ds.approx_rows and ds.approx_rows > 500_000:
+        if not params.confirm_full:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Dataset '{ds.name}' has ~{ds.approx_rows:,} rows. "
+                    f"Full sampling requires confirm_full=true."
+                ),
+            )
+
+    # Guardrail: warn about /mnt path performance
+    data_root = params.dataset_root or (ds.dataset_root if ds else None)
+    if data_root and str(data_root).startswith("/mnt"):
+        logger.warning(
+            f"Dataset root is on /mnt/ ({data_root}). "
+            f"IO will be slow; parquet caching on Linux is recommended."
+        )
+
     # Generate unique run ID
     run_id = str(uuid.uuid4())
 
-    # Resolve artifact path based on data source
-    if params.data_source == "saml-d":
-        artifact_path = f"/mnt/e/xx/saml-d/artifacts/runs/{run_id}"
-    else:
-        artifact_path = f"artifacts/runs/{run_id}"
+    # Artifact path is always under artifacts/runs/<run_id>
+    artifact_path = f"artifacts/runs/{run_id}"
 
     # Create run record
     run = PipelineRun(
@@ -912,3 +976,89 @@ def get_png_generation_status(run_id: str, task_id: str):
         response["error"] = str(result.result)
 
     return response
+
+
+# --- Pipeline Manifest ---
+
+
+@router.get("/{run_id}/pipeline-manifest")
+def get_pipeline_manifest(run_id: str, db: Session = Depends(get_db)):
+    """
+    Return the pipeline_manifest.json for a run.
+
+    Contains step list with roles, role_order, role_counts, env vars, and params.
+    """
+    import json as _json
+
+    run = db.query(PipelineRun).filter(PipelineRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    artifact_dir = _resolve_artifact_dir(run)
+    manifest_path = artifact_dir / "pipeline" / "pipeline_manifest.json"
+
+    if not manifest_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Pipeline manifest not found for this run.",
+        )
+
+    with open(manifest_path) as f:
+        return _json.load(f)
+
+
+# --- Large-Table Pagination (DuckDB) ---
+
+
+@router.get("/{run_id}/table/{table_name}")
+def get_table_page(
+    run_id: str,
+    table_name: str,
+    limit: int = 200,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_order: str = "desc",
+    db: Session = Depends(get_db),
+):
+    """
+    Server-side paginated access to any parquet table in a run's artifacts.
+
+    Uses DuckDB for out-of-core reads, safe for 9.5M-row tables.
+    Table names are sanitised to prevent path traversal.
+
+    Query params:
+        limit / offset — pagination
+        sort_by — column name
+        sort_order — asc or desc
+    """
+    import re as _re
+
+    run = db.query(PipelineRun).filter(PipelineRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    # Sanitise table_name (alphanumeric + underscore only)
+    if not _re.match(r'^[a-zA-Z0-9_]+$', table_name):
+        raise HTTPException(status_code=400, detail="Invalid table name")
+
+    artifact_dir = _resolve_artifact_dir(run)
+
+    # Search common subdirectories for the parquet file
+    parquet_path = None
+    for subdir in ["data", "prepared_data", "queues", "cases", ""]:
+        candidate = artifact_dir / subdir / f"{table_name}.parquet" if subdir else artifact_dir / f"{table_name}.parquet"
+        if candidate.exists():
+            parquet_path = candidate
+            break
+
+    if not parquet_path:
+        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found in run artifacts")
+
+    try:
+        from ...datasets.saml_d_ingest import query_large_table
+
+        order = f"{sort_by} {'ASC' if sort_order == 'asc' else 'DESC'}" if sort_by else None
+        return query_large_table(parquet_path, offset=offset, limit=limit, order_by=order)
+    except Exception as e:
+        logger.error(f"DuckDB query failed for {table_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")

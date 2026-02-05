@@ -501,7 +501,7 @@ make logs         Tail all logs (redis.log, api.log, celery.log, ui.log)
 make clean        Stop + remove .logs/
 
 Dependency Chain: UI -> API -> Redis <- Celery
-Conda env:        amlgan
+Conda env:        amgan2
 ```
 
 ---
@@ -578,7 +578,7 @@ GET    /ping                          Simple ping
 
 ```bash
 # Required
-conda activate amlgan
+conda activate amgan2
 redis-server                          # Message broker
 
 # Environment Variables

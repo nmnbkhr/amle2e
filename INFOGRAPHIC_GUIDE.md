@@ -53,8 +53,8 @@ git checkout v3-enhance
 ### Step 2 -- Create Conda Environment
 
 ```bash
-conda create -n amlgan python=3.10 -y
-conda activate amlgan
+conda create -n amgan2 python=3.10 -y
+conda activate amgan2
 ```
 
 ### Step 3 -- Install Python Dependencies
@@ -73,7 +73,7 @@ pip install -r app/requirements.txt
 ### Step 4 -- Register Jupyter Kernel
 
 ```bash
-python -m ipykernel install --user --name amlgan --display-name "amlgan"
+python -m ipykernel install --user --name amgan2 --display-name "amgan2"
 ```
 
 ### Step 5 -- Install Redis
@@ -100,7 +100,7 @@ Expected output:
 ```text
   Checking prerequisites...
   -------------------------
-  conda env (amlgan):  OK
+  conda env (amgan2):  OK
   redis-server:        OK
   uvicorn:             OK
   celery:              OK
@@ -450,7 +450,7 @@ ls -lh artifacts/runs/4b36a26a-43ee-4793-817a-2a16f7ab4124/report/run_bundle.zip
 
 ```bash
 cd AMLend2end
-conda activate amlgan
+conda activate amgan2
 make run
 ```
 
@@ -482,7 +482,7 @@ redis-server
 #### Terminal 2 -- FastAPI
 
 ```bash
-conda activate amlgan
+conda activate amgan2
 cd AMLend2end
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 ```
@@ -490,7 +490,7 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 #### Terminal 3 -- Celery Worker
 
 ```bash
-conda activate amlgan
+conda activate amgan2
 cd AMLend2end
 celery -A app.workers.celery_app worker -l info
 ```
@@ -498,7 +498,7 @@ celery -A app.workers.celery_app worker -l info
 #### Terminal 4 -- Streamlit UI
 
 ```bash
-conda activate amlgan
+conda activate amgan2
 cd AMLend2end
 streamlit run app/ui/streamlit_app.py --server.port 8501 --server.headless true
 ```
@@ -561,7 +561,7 @@ curl -X POST http://localhost:8000/runs/<run_id>/cancel
 ### Option C: Run Individual Notebooks Manually
 
 ```bash
-conda activate amlgan
+conda activate amgan2
 cd AMLend2end
 jupyter lab
 ```
@@ -917,15 +917,15 @@ redis-server --daemonize yes
 ### "No module named 'adversarialaml'"
 
 ```bash
-conda activate amlgan
+conda activate amgan2
 pip install -e .     # Installs the project in editable mode
 ```
 
-### "Kernel 'amlgan' not found" during pipeline execution
+### "Kernel 'amgan2' not found" during pipeline execution
 
 ```bash
-conda activate amlgan
-python -m ipykernel install --user --name amlgan --display-name "amlgan"
+conda activate amgan2
+python -m ipykernel install --user --name amgan2 --display-name "amgan2"
 ```
 
 ### Port already in use
@@ -972,9 +972,9 @@ curl -X POST http://localhost:8000/runs/<run_id>/cancel
 
 ```text
   1.  git clone ... && cd AMLend2end && git checkout v3-enhance
-  2.  conda create -n amlgan python=3.10 -y && conda activate amlgan
+  2.  conda create -n amgan2 python=3.10 -y && conda activate amgan2
   3.  pip install -e . && pip install -r requirements.txt && pip install -r app/requirements.txt
-  4.  python -m ipykernel install --user --name amlgan
+  4.  python -m ipykernel install --user --name amgan2
   5.  sudo apt-get install redis-server -y
   6.  make check-env
   7.  make run

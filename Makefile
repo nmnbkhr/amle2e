@@ -13,7 +13,7 @@
 SHELL := /bin/bash
 
 # Conda environment
-CONDA_ENV := amlgan
+CONDA_ENV := amgan2
 CONDA_RUN := conda run --no-capture-output -n $(CONDA_ENV)
 
 # Directories
@@ -100,7 +100,7 @@ kill-orphans: $(LOG_DIR) ## Kill orphan services and clean stale PID files
 	@pgrep -f '[c]elery.*app.workers' 2>/dev/null | xargs -r kill -9 2>/dev/null \
 		&& echo -e "    Killed orphan Celery workers" || true
 	@# Kill orphan conda wrappers for this project
-	@pgrep -f '[c]onda run.*amlgan' 2>/dev/null | xargs -r kill -9 2>/dev/null \
+	@pgrep -f '[c]onda run.*amgan2' 2>/dev/null | xargs -r kill -9 2>/dev/null \
 		&& echo -e "    Killed orphan conda wrappers" || true
 	@sleep 1
 	@# Clean stale PID files

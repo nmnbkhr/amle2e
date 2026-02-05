@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..db import init_db
-from .routes import runs_router, status_router, artifacts_router
+from .routes import runs_router, status_router, artifacts_router, pipelines_router
 
 # Configure logging
 logging.basicConfig(
@@ -59,6 +59,7 @@ app.add_middleware(
 app.include_router(runs_router)
 app.include_router(status_router)
 app.include_router(artifacts_router)
+app.include_router(pipelines_router)
 
 
 @app.get("/")
@@ -71,6 +72,8 @@ async def root():
         "health": "/status/health",
         "endpoints": {
             "runs": "/runs",
+            "pipelines": "/pipelines",
+            "datasets": "/datasets",
             "status": "/status",
             "artifacts": "/artifacts",
         },

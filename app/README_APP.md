@@ -33,43 +33,75 @@ This application provides:
 
 ## Quick Start
 
-### 1. Install Dependencies
+### Option A: One Command (Makefile)
 
 ```bash
-# Ensure conda environment is activated
-conda activate amlgan
-
-# Install app-specific dependencies
-pip install -r app/requirements.txt
+make run          # Starts Redis → API → Celery → Streamlit
+make status       # Check what's running
+make stop         # Stop everything
+make logs         # Tail all logs
 ```
 
-### 2. Start Services (4 terminals)
+### Option B: Manual (4 terminals)
 
-**Terminal 1 - Redis:**
 ```bash
+conda activate amgan2
+
+# Terminal 1 - Redis
 redis-server
-```
 
-**Terminal 2 - API Server:**
-```bash
-uvicorn app.api.main:app --reload --port 8000
-```
+# Terminal 2 - API Server (port 8000)
+uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 
-**Terminal 3 - Celery Worker:**
-```bash
+# Terminal 3 - Celery Worker
 celery -A app.workers.celery_app worker --loglevel=info
-```
 
-**Terminal 4 - Streamlit UI:**
-```bash
+# Terminal 4 - Streamlit UI (port 8501)
 streamlit run app/ui/streamlit_app.py
 ```
 
-### 3. Access the Application
+### Install Dependencies
+
+```bash
+conda activate amgan2
+pip install -r requirements.txt
+pip install -r app/requirements.txt
+```
+
+### Access the Application
 
 - **Web UI**: http://localhost:8501
 - **API Docs**: http://localhost:8000/docs
 - **Health Check**: http://localhost:8000/status/health
+
+## Pipelines
+
+| Pipeline | Notebooks | Description |
+|----------|-----------|-------------|
+| `legacy-root` | Root 1-12 | Original Hopsworks pipeline (papermill) |
+| `e2e-core` | e2e/ 01-08 | PyTorch GraphSAGE + WGAN-GP core (env vars) |
+| `e2e-dashboards` | e2e/ 01-10 | Core + interactive dashboards |
+| `e2e-realtime` | e2e/ 11-12 | Real-time simulation (requires prior core run) |
+
+Conditional step: `00_map_external_data` (saml-d) or `00_simulate_transactions` (simulate) prepended automatically.
+
+## Datasets
+
+| Dataset | Source | Size | Default Sampling |
+|---------|--------|------|------------------|
+| `demodata` | `demodata/` | ~67K rows | Full |
+| `simulate` | `demodata/` | Generated fresh | Full |
+| `saml-d` | `/mnt/e/xx/demodata` | ~9.5M rows | Quick (200K) |
+
+Sampling profiles: Quick (200K), Standard (1M), Heavy (3M), Full (all).
+
+## Role Map
+
+Each notebook step is auto-classified into a pipeline phase:
+
+`Ingest → Features → Embeddings → GAN → Scoring → Eval → Dashboards → Realtime`
+
+Roles are shown in the Streamlit Pipeline Map (colored ribbon + Mermaid diagram) and persisted in `pipeline_manifest.json`.
 
 ## Directory Structure
 
@@ -78,7 +110,8 @@ streamlit run app/ui/streamlit_app.py
 ├── api/                    # FastAPI REST API
 │   ├── main.py            # App entry point
 │   └── routes/            # API endpoints
-│       ├── runs.py        # Run management
+│       ├── runs.py        # Run management + pipeline-manifest
+│       ├── pipelines.py   # Pipeline & dataset listing
 │       ├── status.py      # Status monitoring
 │       └── artifacts.py   # Artifact access
 ├── workers/               # Celery background tasks
@@ -86,9 +119,13 @@ streamlit run app/ui/streamlit_app.py
 │   └── tasks.py          # Task definitions
 ├── pipeline_runner/       # Notebook orchestration
 │   ├── orchestrator.py   # Main execution logic
+│   ├── pipeline_registry.py # 4 pipeline variants + role inference
 │   ├── artifacts_index.py # Artifact indexing
 │   ├── metrics_builder.py # Metrics extraction
 │   └── output_map.yaml   # Deterministic output mapping
+├── datasets/              # Dataset registry + ingestion
+│   ├── dataset_registry.py # 3 dataset modes + sampling profiles
+│   └── saml_d_ingest.py  # DuckDB out-of-core ingestion
 ├── db/                    # Database models
 │   ├── models.py         # SQLAlchemy models
 │   └── session.py        # Session management
@@ -96,7 +133,7 @@ streamlit run app/ui/streamlit_app.py
 │   ├── generator.py      # Report builder
 │   └── templates/        # Jinja2 templates
 ├── ui/                   # Streamlit interface
-│   └── streamlit_app.py  # Single-file app
+│   └── streamlit_app.py  # Single-file app (9 tabs)
 ├── requirements.txt      # Dependencies
 └── README_APP.md        # This file
 
@@ -104,11 +141,15 @@ streamlit run app/ui/streamlit_app.py
 └── runs/
     └── <run_id>/
         ├── data/              # Data files (CSV, Parquet)
+        ├── prepared_data/     # DuckDB-ingested parquet (SAML-D)
+        ├── pipeline/          # pipeline_manifest.json
         ├── models/            # Trained models
         ├── plots/             # Visualizations (PNG)
         ├── logs/              # Execution logs
         ├── notebooks_executed/ # Executed notebooks
         ├── metrics/           # metrics.json
+        ├── queues/            # Risk-ranked tier queues
+        ├── cases/             # Investigation cases
         ├── report/            # HTML report
         └── artifact_index.json
 ```
@@ -123,12 +164,22 @@ streamlit run app/ui/streamlit_app.py
 
 ## API Endpoints
 
+### Pipelines & Datasets
+
+- `GET /pipelines` - List all registered pipelines
+- `GET /pipelines/{name}?dataset_mode=...` - Pipeline detail with steps, roles, excluded notebooks
+- `GET /datasets` - List all dataset profiles
+- `GET /datasets/{name}` - Dataset detail with validation status
+- `GET /sampling-profiles` - Sampling profiles (Quick/Standard/Heavy/Full)
+
 ### Runs
 - `POST /runs/` - Start new pipeline run
 - `GET /runs/` - List all runs
 - `GET /runs/{run_id}` - Get run details
 - `GET /runs/{run_id}/metrics` - Get run metrics
 - `GET /runs/{run_id}/artifact-index` - Get artifact index
+- `GET /runs/{run_id}/pipeline-manifest` - Get pipeline manifest (steps, roles, env vars)
+- `GET /runs/{run_id}/table/{name}` - DuckDB-paginated parquet table (2000-row cap)
 - `POST /runs/{run_id}/cancel` - Cancel running pipeline
 - `GET /runs/profiles` - Get available run profiles
 
@@ -209,7 +260,7 @@ Common issues:
 - **Kernel not found**: Install ipykernel in your environment
   ```bash
   pip install ipykernel
-  python -m ipykernel install --user --name amlgan
+  python -m ipykernel install --user --name amgan2
   ```
 - **Timeout**: Increase timeout in run parameters
 - **Memory**: Reduce sample_size or use "quick" profile
@@ -223,13 +274,26 @@ rm app/aml_pipeline.db
 
 ## Adding New Notebooks/Steps
 
-The orchestrator automatically discovers notebooks with the pattern `<number>_<name>.ipynb` in the project root.
+**Legacy pipeline** (`legacy-root`): Auto-discovers `<number>_<name>.ipynb` in root. Add a new numbered notebook and restart.
 
-1. Create your notebook following the naming pattern (e.g., `13_new_step.ipynb`)
-2. Restart the API server to detect the new notebook
-3. The step will be included in subsequent runs
+**E2E pipelines** (`e2e-core`, `e2e-dashboards`, `e2e-realtime`): Steps are explicitly listed in `app/pipeline_runner/pipeline_registry.py`. To add a step:
 
-To use papermill parameters in your notebook:
+1. Create the notebook in `e2e/` (e.g., `08b_new_analysis.ipynb`)
+2. Add the filename to the relevant `_E2E_*_STEPS` list in `pipeline_registry.py`
+3. Add it to `_ALL_E2E_NOTEBOOKS` for excluded-notebook tracking
+4. Restart the API server
+
+**E2E notebooks** read parameters via environment variables (no papermill cells):
+
+```python
+import os
+run_dir = os.environ.get("AML_RUN_DIR", "artifacts/runs/local")
+data_path = os.environ.get("AML_DATA_PATH", "../demodata")
+max_rows = int(os.environ.get("AML_MAX_ROWS", "0")) or None
+```
+
+**Legacy notebooks** use papermill parameter cells:
+
 ```python
 # First cell tagged with "parameters"
 run_id = ""
@@ -266,6 +330,17 @@ Currently using SQLite with auto-creation. For production, consider:
 |----------|---------|-------------|
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
 | `API_URL` | `http://localhost:8000` | API URL for Streamlit |
+| `AML_RUN_ID` | (set per run) | Run identifier |
+| `AML_RUN_DIR` | (set per run) | Artifact directory for current run |
+| `AML_DATASET_MODE` | `demodata` | Dataset mode: demodata, simulate, saml-d |
+| `AML_DATA_PATH` | `demodata/` | Resolved dataset root path |
+| `AML_PREPARED_DATA_DIR` | (set per run) | DuckDB-ingested output dir |
+| `AML_MAX_ROWS` | (from profile) | Row limit for sampling |
+| `AML_SAMPLING_PROFILE` | (from dataset) | Quick, Standard, Heavy, or Full |
+| `AML_SAMPLE_SIZE` | `20000` | Legacy sample size param |
+| `AML_EPOCHS` | `5` | Training epochs |
+| `AML_THRESHOLD` | `0.99` | Anomaly threshold |
+| `AML_SEED` | (optional) | Random seed for reproducibility |
 
 ## License
 

@@ -1,8 +1,10 @@
 """
 Pipeline Orchestrator
 
-Executes the existing AML pipeline notebooks sequentially using papermill.
-Does NOT modify pipeline logic - wraps existing notebooks for execution.
+Executes AML pipeline notebooks sequentially using papermill.
+Supports multiple pipelines (legacy root notebooks, e2e PyTorch pipeline)
+via the pipeline registry, and multiple dataset profiles via the dataset
+registry.
 
 Features:
 - Papermill-based execution with fallback to nbclient
@@ -10,6 +12,8 @@ Features:
 - Progress tracking via callbacks
 - Artifact collection after execution
 - Configurable timeouts and parameters
+- Multi-pipeline support (legacy + e2e)
+- SAML-D out-of-core ingestion via DuckDB
 """
 
 import os
@@ -34,6 +38,19 @@ from ..utils.paths import (
     get_report_dir,
 )
 from ..reports.png_styler import style_pngs
+from .pipeline_registry import (
+    get_pipeline,
+    resolve_steps,
+    write_manifest,
+    PipelineSpec,
+    LEGACY_ROOT,
+)
+from ..datasets.dataset_registry import (
+    get_dataset,
+    get_max_rows,
+    DatasetSpec,
+    SAMPLING_PROFILES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -317,7 +334,10 @@ class PipelineOrchestrator:
 
         Args:
             run_id: Unique identifier for this run
-            params: Optional parameters to customize the run
+            params: Optional parameters to customize the run.
+                    Recognised keys include *pipeline_name* (str, default "legacy-root"),
+                    *dataset_mode* (str, default "demodata"), and
+                    *sampling_profile* (str, default from dataset spec).
             progress_callback: Callback function(step, name, percent) for progress updates
             step_callback: Callback function(step, name, status, error) for step status updates
         """
@@ -330,13 +350,26 @@ class PipelineOrchestrator:
         self.project_root = get_repo_root()
         self._extract_params()
 
-        # Setup paths — use custom artifacts root for SAML-D data source
-        if self.data_source == "saml-d":
-            self.artifacts_dir = Path("/mnt/e/xx/saml-d/artifacts/runs") / run_id
-        else:
-            self.artifacts_dir = get_run_dir(run_id)
+        # Resolve pipeline spec from registry
+        pipeline_name = self.params.get("pipeline_name", "legacy-root")
+        try:
+            self.pipeline_spec: PipelineSpec = get_pipeline(pipeline_name)
+        except KeyError:
+            logger.warning(f"Unknown pipeline '{pipeline_name}', falling back to legacy-root")
+            self.pipeline_spec = LEGACY_ROOT
+
+        # Resolve dataset spec from registry
+        try:
+            self.dataset_spec: DatasetSpec = get_dataset(self.dataset_mode)
+        except KeyError:
+            logger.warning(f"Unknown dataset '{self.dataset_mode}', using demodata defaults")
+            self.dataset_spec = get_dataset("demodata")
+
+        # Setup paths — always under artifacts/runs/<run_id>
+        self.artifacts_dir = get_run_dir(run_id)
 
         self.data_dir = self.artifacts_dir / "data"
+        self.prepared_data_dir = self.artifacts_dir / "prepared_data"
         self.models_dir = self.artifacts_dir / "models"
         self.plots_dir = self.artifacts_dir / "plots"
         self.report_dir = self.artifacts_dir / "report"
@@ -344,24 +377,53 @@ class PipelineOrchestrator:
         self.notebooks_dir = self.artifacts_dir / "notebooks_executed"
         self.metrics_dir = self.artifacts_dir / "metrics"
         self.queues_dir = self.artifacts_dir / "queues"
+        self.pipeline_dir = self.artifacts_dir / "pipeline"
 
         # Create artifact directories
         self._setup_artifact_dirs()
 
-        # Discover notebooks
-        self.pipeline_steps = discover_notebooks(self.project_root)
+        # Resolve notebook steps via pipeline registry (conditional 00 based on dataset_mode)
+        self.pipeline_steps = resolve_steps(
+            self.pipeline_spec,
+            dataset_mode=self.dataset_mode,
+            project_root=self.project_root,
+        )
+        if not self.pipeline_steps:
+            # Fallback: legacy discover_notebooks() for backward compat
+            logger.warning("Pipeline registry returned 0 steps; falling back to discover_notebooks()")
+            self.pipeline_steps = discover_notebooks(self.project_root)
         self.total_steps = len(self.pipeline_steps)
+
+        # Resolve working directory for notebook execution
+        if self.pipeline_spec.cwd_relative:
+            self.notebook_cwd = self.project_root / self.pipeline_spec.cwd_relative
+        else:
+            self.notebook_cwd = self.project_root
 
         # Initialize notebook executor
         self.executor = NotebookExecutor(
-            self.project_root,
+            self.notebook_cwd,
             self.notebooks_dir,
             self.logs_dir,
+        )
+
+        # Write pipeline manifest
+        env_vars = self._build_env_vars()
+        write_manifest(
+            self.artifacts_dir,
+            self.pipeline_spec,
+            self.pipeline_steps,
+            self.params,
+            env_vars,
         )
 
         # Results accumulator
         self.results = {
             "run_id": run_id,
+            "pipeline_name": self.pipeline_spec.name,
+            "dataset_mode": self.dataset_mode,
+            "sampling_profile": self.sampling_profile,
+            "max_rows": self.max_rows,
             "total_nodes": None,
             "total_transactions": None,
             "anomalies_detected": None,
@@ -371,9 +433,13 @@ class PipelineOrchestrator:
         }
 
         logger.info(f"Orchestrator initialized for run {run_id}")
+        logger.info(f"Pipeline: {self.pipeline_spec.display_name} ({self.pipeline_spec.name})")
+        logger.info(f"Dataset: {self.dataset_spec.display_name} (mode={self.dataset_mode})")
+        logger.info(f"Sampling: {self.sampling_profile} (max_rows={self.max_rows})")
         logger.info(f"Project root: {self.project_root}")
+        logger.info(f"Notebook CWD: {self.notebook_cwd}")
         logger.info(f"Artifacts dir: {self.artifacts_dir}")
-        logger.info(f"Discovered {self.total_steps} pipeline steps")
+        logger.info(f"Resolved {self.total_steps} pipeline steps")
 
     def _extract_params(self):
         """Extract and validate run parameters."""
@@ -399,23 +465,53 @@ class PipelineOrchestrator:
         self.generate_viz = self.params.get("generate_visualizations", True)
         self.generate_report = self.params.get("generate_report", True)
 
-        # Data source configuration
-        self.data_source = self.params.get("data_source", "demo-data")
-        self.data_path = self.params.get("data_path")
+        # Dataset mode + sampling profile
+        self.dataset_mode = self.params.get("dataset_mode", "demodata")
+        self.sampling_profile = self.params.get("sampling_profile")
+        self.dataset_root_override = self.params.get("dataset_root")
+
+        # Resolve max_rows from sampling profile or explicit override
+        max_rows_override = self.params.get("max_rows")
+        if self.sampling_profile:
+            self.max_rows = get_max_rows(self.sampling_profile, max_rows_override)
+        elif max_rows_override:
+            self.max_rows = max_rows_override
+        else:
+            # Use dataset spec's default sampling profile
+            try:
+                ds = get_dataset(self.dataset_mode)
+                self.max_rows = get_max_rows(ds.default_sampling)
+                self.sampling_profile = ds.default_sampling
+            except KeyError:
+                self.max_rows = None
+                self.sampling_profile = "Full"
+
+        # Resolve data_path from dataset_root override or registry
+        self.data_path = self.dataset_root_override
         if not self.data_path:
-            if self.data_source == "saml-d":
-                self.data_path = "/mnt/e/xx/demodata"
-            else:
-                self.data_path = str(self.project_root / "demodata")
+            try:
+                ds = get_dataset(self.dataset_mode)
+                root_str = ds.dataset_root or "demodata"
+                data_root = Path(root_str)
+                if not data_root.is_absolute():
+                    data_root = self.project_root / data_root
+                self.data_path = str(data_root)
+            except KeyError:
+                if self.dataset_mode == "saml-d":
+                    self.data_path = "/mnt/e/xx/demodata"
+                else:
+                    self.data_path = str(self.project_root / "demodata")
 
         logger.info(f"Run parameters: sample_size={self.sample_size}, epochs={self.epochs}, "
                     f"threshold={self.threshold}, timeout={self.notebook_timeout}s, "
-                    f"data_source={self.data_source}, data_path={self.data_path}")
+                    f"dataset_mode={self.dataset_mode}, sampling={self.sampling_profile}, "
+                    f"max_rows={self.max_rows}, data_path={self.data_path}")
 
     def _setup_artifact_dirs(self):
         """Create the artifact directory structure for this run."""
         dirs = [
             self.data_dir,
+            self.prepared_data_dir,
             self.models_dir,
             self.plots_dir,
             self.report_dir,
@@ -423,6 +519,7 @@ class PipelineOrchestrator:
             self.notebooks_dir,
             self.metrics_dir,
             self.queues_dir,
+            self.pipeline_dir,
         ]
         for dir_path in dirs:
             dir_path.mkdir(parents=True, exist_ok=True)
@@ -460,9 +557,40 @@ class PipelineOrchestrator:
             "data_path": self.data_path,
         }
 
+    def _build_env_vars(self) -> Dict[str, str]:
+        """
+        Build the environment variables dict for e2e pipelines.
+
+        These are set before each notebook execution (for non-papermill
+        pipelines) and also recorded in the pipeline manifest.
+        """
+        env = {
+            "AML_RUN_ID": self.run_id,
+            "AML_RUN_DIR": str(self.artifacts_dir),
+            "AML_PREPARED_DATA_DIR": str(self.prepared_data_dir),
+            "AML_DATASET_MODE": self.dataset_mode,
+            "AML_DATA_PATH": self.data_path,
+            "AML_ARTIFACTS_DIR": str(self.artifacts_dir),
+            "AML_SAMPLE_SIZE": str(self.sample_size),
+            "AML_EPOCHS": str(self.epochs),
+            "AML_THRESHOLD": str(self.threshold),
+        }
+        if self.max_rows is not None:
+            env["AML_MAX_ROWS"] = str(self.max_rows)
+        if self.sampling_profile:
+            env["AML_SAMPLING_PROFILE"] = self.sampling_profile
+        seed = self.params.get("seed")
+        if seed is not None:
+            env["AML_SEED"] = str(seed)
+        return env
+
     def _execute_notebook(self, step: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a single notebook step.
+
+        Resolves the notebook path from the pipeline spec's notebook directory
+        and injects parameters via papermill (legacy) or environment variables
+        (e2e pipelines without papermill cells).
 
         Args:
             step: Step dictionary with notebook info
@@ -474,7 +602,15 @@ class PipelineOrchestrator:
         step_num = step["number"]
         step_name = step["name"]
 
-        notebook_path = self.project_root / notebook_name
+        # Resolve path: use the step's full path if available, else look in notebooks_dir
+        if step.get("path") and Path(step["path"]).exists():
+            notebook_path = Path(step["path"])
+        else:
+            nb_dir = self.project_root / self.pipeline_spec.notebooks_dir
+            notebook_path = nb_dir / notebook_name
+            if not notebook_path.exists():
+                notebook_path = self.project_root / notebook_name
+
         if not notebook_path.exists():
             logger.warning(f"Notebook not found: {notebook_path}")
             return {
@@ -489,12 +625,22 @@ class PipelineOrchestrator:
         # Get parameters for this notebook
         parameters = self._get_notebook_parameters()
 
-        # Execute notebook
-        success, output_path, error = self.executor.execute(
-            notebook_path,
-            parameters,
-            timeout=self.notebook_timeout,
-        )
+        # For pipelines that don't support papermill, inject via env vars
+        env_backup = {}
+        if not self.pipeline_spec.supports_papermill:
+            env_backup = self._set_env_parameters(parameters)
+            parameters = {}  # don't pass to papermill
+
+        try:
+            # Execute notebook
+            success, output_path, error = self.executor.execute(
+                notebook_path,
+                parameters,
+                timeout=self.notebook_timeout,
+            )
+        finally:
+            # Restore environment
+            self._restore_env(env_backup)
 
         end_time = datetime.utcnow()
         duration = (end_time - start_time).total_seconds()
@@ -517,6 +663,39 @@ class PipelineOrchestrator:
             result["log_path"] = str(log_path)
 
         return result
+
+    def _set_env_parameters(self, parameters: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        """
+        Set notebook parameters as environment variables.
+
+        For e2e pipelines: sets AML_* env vars (run dir, data paths, etc.)
+        For legacy pipelines: sets AML_PIPELINE_* env vars (papermill-style).
+
+        Returns a dict of previous values for restoration.
+        """
+        backup: Dict[str, Optional[str]] = {}
+
+        # Always set the AML_* env vars (e2e notebooks read these)
+        for env_key, value in self._build_env_vars().items():
+            backup[env_key] = os.environ.get(env_key)
+            os.environ[env_key] = str(value)
+
+        # Also set AML_PIPELINE_* for legacy compatibility
+        for key, value in parameters.items():
+            env_key = f"AML_PIPELINE_{key.upper()}"
+            backup[env_key] = os.environ.get(env_key)
+            os.environ[env_key] = str(value)
+
+        return backup
+
+    @staticmethod
+    def _restore_env(backup: Dict[str, Optional[str]]) -> None:
+        """Restore environment variables from backup."""
+        for key, old_value in backup.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
     def _collect_outputs(self):
         """
@@ -670,6 +849,24 @@ class PipelineOrchestrator:
         failed_steps = 0
 
         try:
+            # ── Pre-pipeline: dataset ingestion (SAML-D DuckDB) ──
+            if self.dataset_spec.requires_ingest:
+                self._update_progress(0, "Ingesting dataset via DuckDB", 1)
+                try:
+                    from ..datasets.saml_d_ingest import prepare_dataset
+
+                    ingest_result = prepare_dataset(
+                        data_root=Path(self.data_path),
+                        prepared_dir=self.prepared_data_dir,
+                        max_rows=self.max_rows,
+                        cache_root=Path(self.dataset_spec.cache_root) if self.dataset_spec.cache_root else None,
+                    )
+                    self.results["ingest"] = ingest_result
+                    logger.info(f"Dataset ingestion complete: {ingest_result}")
+                except Exception as e:
+                    logger.error(f"Dataset ingestion failed: {e}")
+                    raise RuntimeError(f"Dataset ingestion failed: {e}") from e
+
             for step in self.pipeline_steps:
                 step_num = step["number"]
                 step_name = step["name"]
